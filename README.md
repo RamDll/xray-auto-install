@@ -24,7 +24,9 @@ bash <(wget -qO- https://raw.githubusercontent.com/RamDll/xray-auto-install/main
 
 1. Готовит систему: снимает apt-daily/unattended-upgrades (чтобы не держали
    dpkg-lock на свежем VPS), чинит незавершённый `dpkg` прошлых прогонов,
-   обновляет пакеты (`curl unzip nginx openssl nftables`) с ретраями,
+   делает `apt dist-upgrade` (обновляет уже установленные системные пакеты —
+   свежий образ провайдера может нести старые версии с известными дырами),
+   ставит нужные пакеты (`curl unzip nginx openssl nftables`) с ретраями,
    проверяет синхронизацию времени (важно для TLS/Reality) — все apt-вызовы
    идут с ожиданием dpkg-lock и тремя попытками.
 2. Включает BBR (персистентно, переживает перезагрузку).

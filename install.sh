@@ -149,6 +149,8 @@ dpkg --configure -a >/dev/null 2>&1 || true
 
 log "apt update"
 apt_do update -qq
+log "apt dist-upgrade"
+apt_do -y dist-upgrade -qq >/dev/null
 log "устанавливаю пакеты"
 apt_do -y install -qq curl unzip nginx openssl nftables ca-certificates >/dev/null
 systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true

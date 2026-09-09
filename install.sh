@@ -189,7 +189,10 @@ for try in 1 2 3; do
 done
 [[ "$XRAY_INSTALL_OK" == 1 ]] || die "не удалось установить Xray-core после 3 попыток"
 [ -x /usr/local/bin/xray ] || die "установщик отработал, но /usr/local/bin/xray не найден"
-/usr/local/bin/xray version | head -1
+/usr/local/bin/xray version   # печатает 2 строки; НЕ пайпить в head — xray version | head -1
+                               # ловит SIGPIPE (head закрывает трубу после 1-й строки, xray
+                               # падает на второй write) => exit 141 под set -o pipefail,
+                               # воспроизведено вживую на 95.128.157.141
 
 log "генерирую ключи"
 UUID=$(/usr/local/bin/xray uuid)
@@ -199,9 +202,15 @@ X25519_OUT=$(/usr/local/bin/xray x25519)
 PRIVATE_KEY=$(echo "$X25519_OUT" | grep -iE '^Private ?key' | sed -E 's/^[^:]+:\s*//')
 PUBLIC_KEY=$(echo "$X25519_OUT" | grep -iE '^Public ?key|^Password' | head -1 | sed -E 's/^[^:]+:\s*//')
 
+# `xray vlessenc` печатает ДВА раздела: "X25519, not Post-Quantum" (короткие
+# значения) и "ML-KEM-768, Post-Quantum" (длинные — то, что нам реально нужно).
+# Оба варианта используют одинаковый строковый префикс mlkem768x25519plus.native,
+# поэтому берём только то, что идёт ПОСЛЕ заголовка ML-KEM-768 — иначе можно
+# молча получить не-PQC вариант (нашёл на живом прогоне на 95.128.157.141).
 VLESSENC_OUT=$(/usr/local/bin/xray vlessenc)
-DECRYPTION=$(echo "$VLESSENC_OUT" | grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' | head -1)
-ENCRYPTION=$(echo "$VLESSENC_OUT" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' | head -1)
+VLESSENC_PQ=$(echo "$VLESSENC_OUT" | awk '/ML-KEM-768/{f=1} f')
+DECRYPTION=$(echo "$VLESSENC_PQ" | grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' | head -1)
+ENCRYPTION=$(echo "$VLESSENC_PQ" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' | head -1)
 
 [ -n "$UUID" ] && [ -n "$SHORT_ID" ] && [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] \
   && [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] || {

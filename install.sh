@@ -246,15 +246,141 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /etc/nginx/fakesite-ssl/key.pem -out /etc/nginx/fakesite-ssl/cert.pem \
   -days 3650 -nodes -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
 
+# Заглушка отдаёт настоящую HTML-страницу, а не голый "OK" — если кто-то
+# зайдёт на dest без валидной REALITY-авторизации (обычный curl/браузер),
+# видит правдоподобный, нейтральный "статус-страница" сайт вместо явного
+# признака "это заглушка VPN". Жанр выбран сознательно — тысячи реальных
+# компаний держат почти такой же шаблон (Statuspage/Instatus-стиль), не
+# привязан ни к какому конкретному бренду, поэтому подходит под любой SNI
+# из пула.
+mkdir -p /etc/nginx/fakesite-html
+cat > /etc/nginx/fakesite-html/index.html <<'HTMLEOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian Status</title>
+<style>
+  :root {
+    --bg: #f7f8fa;
+    --surface: #ffffff;
+    --border: #e3e6ea;
+    --text: #1a2233;
+    --text-dim: #6b7683;
+    --good: #1a9e5c;
+    --good-bg: #e7f7ee;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 24px 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 40px; }
+  .brand-mark {
+    width: 28px; height: 28px; border-radius: 7px;
+    background: linear-gradient(135deg, #2b3a55, #1a2233);
+    flex-shrink: 0;
+  }
+  .brand-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+  .status-banner {
+    display: flex; align-items: center; gap: 12px;
+    background: var(--good-bg); border: 1px solid #c7ecd8;
+    border-radius: 10px; padding: 16px 18px; margin-bottom: 36px;
+  }
+  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--good); flex-shrink: 0; }
+  .status-banner strong { font-size: 15px; font-weight: 600; color: #0f6b3d; }
+  .status-banner span { display: block; font-size: 12.5px; color: #3d7a5a; margin-top: 1px; }
+
+  .section-title {
+    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--text-dim); margin: 0 0 12px;
+  }
+  .services {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
+    margin-bottom: 36px;
+  }
+  .svc-row {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid var(--border);
+  }
+  .svc-row:last-child { border-bottom: none; }
+  .svc-name { font-size: 14px; font-weight: 500; }
+  .svc-right { display: flex; align-items: center; gap: 8px; }
+  .svc-right .status-dot { width: 7px; height: 7px; }
+  .svc-right span { font-size: 12.5px; color: var(--good); font-weight: 500; }
+
+  .uptime-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+  .uptime-title span:last-child { font-size: 12px; color: var(--text-dim); }
+  .bars { display: flex; gap: 2px; height: 32px; margin-bottom: 8px; }
+  .bar { flex: 1; background: var(--good); border-radius: 2px; opacity: 0.85; }
+  .bars-caption { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
+
+  footer {
+    margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--border);
+    font-size: 12px; color: var(--text-dim); display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div class="brand-name">Meridian &middot; Status</div>
+    </div>
+
+    <div class="status-banner">
+      <div class="status-dot"></div>
+      <div>
+        <strong>All systems operational</strong>
+        <span>No incidents reported in the last 90 days</span>
+      </div>
+    </div>
+
+    <div class="section-title">Services</div>
+    <div class="services">
+      <div class="svc-row"><span class="svc-name">API</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
+      <div class="svc-row"><span class="svc-name">Dashboard</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
+      <div class="svc-row"><span class="svc-name">Authentication</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
+      <div class="svc-row"><span class="svc-name">Edge network</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
+      <div class="svc-row"><span class="svc-name">Webhooks</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
+    </div>
+
+    <div class="uptime-title"><span class="section-title" style="margin:0">90-day uptime</span><span>99.98%</span></div>
+    <div class="bars" id="bars"></div>
+    <div class="bars-caption"><span>90 days ago</span><span>Today</span></div>
+
+    <footer>
+      <span>&copy; Meridian Systems</span>
+      <span id="ts">Updated just now</span>
+    </footer>
+  </div>
+  <script>
+    var b = document.getElementById('bars');
+    for (var i = 0; i < 90; i++) {
+      var d = document.createElement('div');
+      d.className = 'bar';
+      if (Math.random() < 0.02) d.style.opacity = 0.35;
+      b.appendChild(d);
+    }
+    document.getElementById('ts').textContent = 'Updated ' + new Date().toUTCString();
+  </script>
+</body>
+</html>
+HTMLEOF
+
 cat > /etc/nginx/conf.d/fakesite.conf <<EOF
 server {
     listen 127.0.0.1:${DEST_PORT} ssl;
     server_name ${SNI};
     ssl_certificate /etc/nginx/fakesite-ssl/cert.pem;
     ssl_certificate_key /etc/nginx/fakesite-ssl/key.pem;
-    location / {
-        return 200 "OK\n";
-    }
+    root /etc/nginx/fakesite-html;
+    index index.html;
 }
 EOF
 nginx -t >/dev/null
@@ -298,7 +424,7 @@ systemctl restart xray
 sleep 1
 systemctl is-active --quiet xray || { echo "xray не запустился" >&2; journalctl -u xray --no-pager -n 40 >&2; exit 1; }
 ss -ltnp | grep -q ':443 ' || { echo "порт 443 не слушается" >&2; exit 1; }
-curl -sk "https://127.0.0.1:${DEST_PORT}/" | grep -q OK || { echo "fakesite не отвечает" >&2; exit 1; }
+curl -sk "https://127.0.0.1:${DEST_PORT}/" | grep -q "Meridian" || { echo "fakesite не отвечает" >&2; exit 1; }
 
 echo "===XRAY_AUTO_INSTALL_VARS==="
 echo "UUID=${UUID}"

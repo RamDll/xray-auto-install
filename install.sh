@@ -112,8 +112,8 @@ wait_dpkg_lock() {
   local w=0 max=180
   while pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr|packagekitd' >/dev/null 2>&1 \
      || fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
-    (( w >= max )) && { log "dpkg-lock ещё занят после ${max}с — пробую всё равно"; return 0; }
-    (( w % 20 == 0 )) && log "dpkg-lock занят (cloud-init?) — жду... ${w}/${max}с"
+    if (( w >= max )); then log "dpkg-lock ещё занят после ${max}с — пробую всё равно"; return 0; fi
+    if (( w % 20 == 0 )); then log "dpkg-lock занят (cloud-init?) — жду... ${w}/${max}с"; fi
     sleep 5; w=$((w + 5))
   done
   return 0
@@ -148,7 +148,7 @@ ntp_ok() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == ye
 ntp_daemon_up() {
   local s
   for s in systemd-timesyncd chrony chronyd ntpsec ntpd openntpd; do
-    systemctl is-active --quiet "$s" 2>/dev/null && return 0
+    if systemctl is-active --quiet "$s" 2>/dev/null; then return 0; fi
   done
   return 1
 }
@@ -310,7 +310,7 @@ echo "  OK — сервис xray активен, порт 443 слушается
 # ---------------------------------------------------------------------------
 
 log "Генерирую SSH-ключ (${KEY_PATH})..."
-[ -f "$KEY_PATH" ] && rm -f "$KEY_PATH" "$KEY_PATH.pub"
+if [ -f "$KEY_PATH" ]; then rm -f "$KEY_PATH" "$KEY_PATH.pub"; fi
 ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "xray-auto-install-${SERVER_IP}" >/dev/null
 
 PUBKEY_CONTENT="$(cat "${KEY_PATH}.pub")"
@@ -355,7 +355,7 @@ backup_capped() {
   cp -a "$file" "${file}.bak.$(date +%s)"
   local old
   mapfile -t old < <(ls -1t "${file}".bak.* 2>/dev/null | tail -n +4)
-  [[ ${#old[@]} -gt 0 ]] && rm -f -- "${old[@]}"
+  if [[ ${#old[@]} -gt 0 ]]; then rm -f -- "${old[@]}"; fi
 }
 
 socket_active() {
@@ -365,6 +365,18 @@ socket_active() {
 
 restart_ssh() {
   systemctl daemon-reload
+  # reload (SIGHUP) — sshd перечитывает конфиг, НЕ убивая текущие сессии.
+  # `restart` здесь опасен: мы выполняемся ВНУТРИ дерева процессов ssh.service
+  # (эта самая SSH-сессия — его потомок), а systemd по умолчанию
+  # (KillMode=control-group) при restart убивает ВСЮ cgroup юнита — включая
+  # текущую сессию и сам скрипт — раньше, чем новый sshd успевает подняться.
+  # Поймано вживую на 95.128.157.141: lockdown оборвался без единой строчки
+  # вывода, новый sshd так и не стартовал, connection пропала. Порт мы никогда
+  # не меняем, так что reload всегда достаточно; restart — только fallback.
+  if systemctl reload ssh.service 2>/dev/null || systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null; then
+    return 0
+  fi
+  log "reload не поддержан — fallback на restart (риск оборвать текущую сессию)"
   if socket_active; then
     systemctl restart ssh.socket
     systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true
@@ -436,7 +448,7 @@ EOF
   # соединением с домашней машины.
   systemd-run --unit=xray-auto-install-ssh-rollback --on-active=180 \
     --description="xray-auto-install: откат отключения пароля, если не подтверждено" \
-    /bin/bash -c "rm -f ${DROPIN_NOPASS}; systemctl daemon-reload; systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true" \
+    /bin/bash -c "rm -f ${DROPIN_NOPASS}; systemctl daemon-reload; systemctl reload ssh.service 2>/dev/null || systemctl reload ssh 2>/dev/null || systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true" \
     >/dev/null 2>&1 || log "systemd-run недоступен — страховочный таймер не поставлен (действую без него)"
 
   restart_ssh
@@ -548,8 +560,9 @@ EOF
   nft -f /etc/nftables.conf || { nft flush ruleset; die "nft -f упал — откатил (flush ruleset)"; }
   systemctl enable nftables >/dev/null 2>&1 || true
 
-  systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 ' \
-    || log "предупреждение: xray/443 не выглядят активными после применения firewall"
+  if ! { systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '; }; then
+    log "предупреждение: xray/443 не выглядят активными после применения firewall"
+  fi
   log "firewall применён — жду confirm с домашней машины (иначе откат через 2 мин)"
 
 elif [[ "$STAGE" == "confirm" ]]; then

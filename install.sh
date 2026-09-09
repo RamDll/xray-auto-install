@@ -74,6 +74,15 @@ scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp -o StrictHostKeyChecking=accept-new 
 ssh_key() { ssh "${SSH_KEY_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
 scp_key() { scp -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$KEY_PATH" -P "$SSH_PORT" "$@"; }
 
+# Скрипт рассчитан на свежий/переустановленный сервер по этому же IP — смена
+# хост-ключа тут норма (новый образ = новый ключ), а не признак MITM. Тихо
+# чистим старую запись под этот конкретный IP перед подключением, чтобы не
+# упасть на "Host key verification failed"; если записи нет — no-op.
+if ssh-keygen -F "$SERVER_IP" >/dev/null 2>&1; then
+  ssh-keygen -R "$SERVER_IP" >/dev/null 2>&1
+  echo "  (старый хост-ключ для ${SERVER_IP} в known_hosts очищен — сервер переустановлен)"
+fi
+
 log "Проверяю парольный доступ к ${SERVER_IP}..."
 ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться по паролю. Проверь IP и пароль."
 echo "  OK"

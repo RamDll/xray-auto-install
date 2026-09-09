@@ -580,6 +580,21 @@ EOF
   nft -f /etc/nftables.conf || { nft flush ruleset; die "nft -f упал — откатил (flush ruleset)"; }
   systemctl enable nftables >/dev/null 2>&1 || true
 
+  # nf_conntrack гарантированно загружен только теперь (правило `ct state`
+  # в применённом ruleset его подтягивает) — раньше в скрипте sysctl-ключ
+  # мог ещё не существовать. Дефолт (обычно 8192 на VPS с ~1ГБ RAM) хватает
+  # на 1-2 человек, но современная веб-страница у одного клиента легко
+  # держит десятки параллельных TCP-соединений + XHTTP сам многопоточен —
+  # при нескольких активных пользователях таблица переполняется, и новые
+  # соединения молча дропаются. Поднимаем с запасом; цена — доли МБ RAM.
+  if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
+    echo "net.netfilter.nf_conntrack_max = 32768" > /etc/sysctl.d/99-conntrack.conf
+    sysctl -qp /etc/sysctl.d/99-conntrack.conf
+    log "nf_conntrack_max поднят до 32768"
+  else
+    log "nf_conntrack_max недоступен (модуль не загружен?) — пропускаю"
+  fi
+
   if ! { systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '; }; then
     log "предупреждение: xray/443 не выглядят активными после применения firewall"
   fi

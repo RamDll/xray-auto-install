@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 #
 # xray-auto-install — native (no Docker, no panel) VLESS + XHTTP + Reality + Vision
-# + post-quantum VLESS Encryption (mlkem768x25519plus), on a fresh Debian/Ubuntu box.
+# + VLESS Encryption (mlkem768x25519plus, ephemeral X25519 variant — not full
+# ML-KEM-768; see the comment above VLESSENC_X25519 below for why), on a fresh
+# Debian/Ubuntu box.
 #
 # Usage:
 #   ./install.sh
@@ -214,14 +216,21 @@ PRIVATE_KEY=$(echo "$X25519_OUT" | grep -iE '^Private ?key' | sed -E 's/^[^:]+:\
 PUBLIC_KEY=$(echo "$X25519_OUT" | grep -iE '^Public ?key|^Password' | head -1 | sed -E 's/^[^:]+:\s*//')
 
 # `xray vlessenc` печатает ДВА раздела: "X25519, not Post-Quantum" (короткие
-# значения) и "ML-KEM-768, Post-Quantum" (длинные — то, что нам реально нужно).
+# значения, ~44 символа) и "ML-KEM-768, Post-Quantum" (длинные, ~1600+ символов
+# — полноценный ML-KEM-768). Берём КОРОТКИЙ, эфемерный X25519-вариант: сам
+# `xray vlessenc` в шапке вывода прямо пишет "Ephemeral key exchange is
+# Post-Quantum safe anyway" — эфемерность ключа уже даёт защиту от
+# harvest-now-decrypt-later, полный ML-KEM-768 тут даёт лишь дополнительную
+# алгоритмическую стойкость ценой гигантской ссылки/QR. Это же — короткий
+# вариант — было в изначальной вручную протестированной и подтверждённой
+# рабочей конфигурации 138.124.71.35 (в её summary он был ошибочно подписан
+# "постквантовое шифрование" — на деле это не так, см. историю в чате).
 # Оба варианта используют одинаковый строковый префикс mlkem768x25519plus.native,
-# поэтому берём только то, что идёт ПОСЛЕ заголовка ML-KEM-768 — иначе можно
-# молча получить не-PQC вариант (нашёл на живом прогоне на 95.128.157.141).
+# поэтому явно обрезаем вывод ДО заголовка ML-KEM-768, чтобы не выхватить его.
 VLESSENC_OUT=$(/usr/local/bin/xray vlessenc)
-VLESSENC_PQ=$(echo "$VLESSENC_OUT" | awk '/ML-KEM-768/{f=1} f')
-DECRYPTION=$(echo "$VLESSENC_PQ" | grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' | head -1)
-ENCRYPTION=$(echo "$VLESSENC_PQ" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' | head -1)
+VLESSENC_X25519=$(echo "$VLESSENC_OUT" | awk '/ML-KEM-768/{exit} {print}')
+DECRYPTION=$(echo "$VLESSENC_X25519" | grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' | head -1)
+ENCRYPTION=$(echo "$VLESSENC_X25519" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' | head -1)
 
 [ -n "$UUID" ] && [ -n "$SHORT_ID" ] && [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] \
   && [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] || {
@@ -607,7 +616,7 @@ fi
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#${SERVER_IP}"
 
 cat > "$SUMMARY_FILE" <<EOF
-xray-auto-install — VLESS + XHTTP + Reality + Vision + PQC
+xray-auto-install — VLESS + XHTTP + Reality + Vision + VLESS Encryption
 Сервер: ${SERVER_IP}
 Дата: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -624,7 +633,7 @@ nftables, policy drop, открыты только:
 ${VLESS_LINK}
 
 == Важно ==
-- Нужен клиент с поддержкой VLESS Encryption (PQC): свежий v2rayNG/Happ/sing-box.
+- Нужен клиент с поддержкой VLESS Encryption: свежий v2rayNG/Happ/sing-box.
 - Если ссылка перестанет подключаться — попробуй заменить fp=firefox на fp=safari
   или fp=ios прямо в ссылке (см. README).
 EOF

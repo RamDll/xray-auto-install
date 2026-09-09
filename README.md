@@ -18,8 +18,16 @@
 3. Ставит официальным установщиком `XTLS/Xray-install` **последний стабильный**
    релиз Xray-core (установщик сам резолвит `/releases/latest`, что уже
    исключает pre-release теги), с ретраями на случай сетевого сбоя.
-4. Генерирует UUID, X25519-пару (Reality) и постквантовую VLESS-пару шифрования
-   (`mlkem768x25519plus`) через `xray vlessenc`.
+4. Генерирует UUID, X25519-пару (Reality) и VLESS-пару шифрования
+   (`mlkem768x25519plus`) через `xray vlessenc` — **короткий, эфемерный
+   X25519-вариант**, не полный ML-KEM-768 (`xray vlessenc` печатает оба;
+   разница на порядок в размере ключа — короткий умещается в разумную ссылку/QR,
+   длинный превращает её в кирпич текста). Сам `xray vlessenc` в шапке вывода
+   прямо говорит: *"Ephemeral key exchange is Post-Quantum safe anyway"* —
+   эфемерность ключа уже защищает от harvest-now-decrypt-later, полный
+   ML-KEM-768 даёт лишь дополнительную алгоритмическую стойкость ценой размера
+   ссылки. Это тот же вариант, что был в изначальной, вручную протестированной
+   и подтверждённой конфигурации 138.124.71.35.
 5. Выбирает Reality SNI случайно из пула 16 крупных tech-доменов
    (`www.microsoft.com`, `www.bing.com`, `www.samsung.com`, `www.nvidia.com`,
    `www.amd.com`, `www.intel.com`, `www.cloudflare.com`, `cdn.jsdelivr.net`,
@@ -35,9 +43,11 @@
    требует, и её домену не нужно быть реально доступным в интернете — сервер
    к нему не ходит.
 6. Пишет `/usr/local/etc/xray/config.json`: VLESS + XHTTP (транспорт) + Reality
-   (маскировка) + `xtls-rprx-vision` (flow) + PQC-шифрование. Именно эта
-   комбинация требует PQC — `encryption: none` с `xhttp`+`vision` не работает
-   (`XTLS only supports TLS and REALITY directly for now`).
+   (маскировка) + `xtls-rprx-vision` (flow) + VLESS Encryption. Именно
+   какая-то форма VLESS Encryption тут обязательна — `encryption: none` с
+   `xhttp`+`vision` не работает (`XTLS only supports TLS and REALITY directly
+   for now`); версия с полным ML-KEM-768 тоже подошла бы, но не нужна для
+   самого факта совместимости.
 7. Генерирует новый SSH-ключ, добавляет его на сервер и **проверяет новым
    соединением**, прежде чем что-либо трогать в sshd.
 8. SSH-hardening в два шага, каждый — с полной страховкой:
@@ -80,7 +90,7 @@ socket-activated SSH, автооткат по таймеру) унаследов
 vless://<uuid>@<ip>:443?encryption=mlkem768x25519plus...&flow=xtls-rprx-vision&security=reality&sni=<random-domain-from-pool>&fp=firefox&pbk=...&sid=...&spx=%2F&type=xhttp#xray-auto-install
 ```
 
-Нужен клиент с поддержкой VLESS Encryption (PQC) — свежие v2rayNG / Happ /
+Нужен клиент с поддержкой VLESS Encryption — свежие v2rayNG / Happ /
 sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp=chrome` не заработал
 на реальном мобильном клиенте, `fp=firefox` — заработал (причина
 клиент-специфична, не выяснялась). В отличие от SNI, `fp` **не рандомизируется**:

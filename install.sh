@@ -571,7 +571,7 @@ fi
 # 5. Output
 # ---------------------------------------------------------------------------
 
-VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#xray-auto-install"
+VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#${SERVER_IP}"
 
 cat > "$SUMMARY_FILE" <<EOF
 xray-auto-install — VLESS + XHTTP + Reality + Vision + PQC

@@ -424,7 +424,19 @@ systemctl restart xray
 sleep 1
 systemctl is-active --quiet xray || { echo "xray не запустился" >&2; journalctl -u xray --no-pager -n 40 >&2; exit 1; }
 ss -ltnp | grep -q ':443 ' || { echo "порт 443 не слушается" >&2; exit 1; }
-curl -sk "https://127.0.0.1:${DEST_PORT}/" | grep -q "Meridian" || { echo "fakesite не отвечает" >&2; exit 1; }
+# retry: сразу после `enable --now` + `reload` nginx иногда ловит короткое
+# окно, когда TLS-листенер ещё не до конца поднялся (SSL_do_handshake failed
+# / unexpected ccs message в error.log) — поймано вживую, через 1-2с само
+# проходит, единичная проверка тут даёт ложный негатив.
+FAKESITE_OK=0
+for try in 1 2 3 4 5; do
+  if curl -sk "https://127.0.0.1:${DEST_PORT}/" 2>/dev/null | grep -q "Meridian"; then
+    FAKESITE_OK=1
+    break
+  fi
+  sleep 1
+done
+[[ "$FAKESITE_OK" == 1 ]] || { echo "fakesite не отвечает после 5 попыток" >&2; exit 1; }
 
 echo "===XRAY_AUTO_INSTALL_VARS==="
 echo "UUID=${UUID}"

@@ -285,9 +285,10 @@ sed -i "s/__SNI__/${SNI}/; s/__DEST_PORT__/${DEST_PORT}/" "$WORKDIR/bootstrap.sh
 
 log "Заливаю и запускаю bootstrap на сервере (это займёт минуту-две)..."
 scp_pw "$WORKDIR/bootstrap.sh" "root@${SERVER_IP}:/root/bootstrap.sh"
-BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh")" \
-  || die "Bootstrap упал. Смотри вывод выше."
-echo "$BOOTSTRAP_OUT" | sed '/^===XRAY_AUTO_INSTALL_VARS===$/,$d'
+BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>&1)" || {
+  echo "$BOOTSTRAP_OUT" >&2
+  die "Bootstrap упал (полный вывод выше)."
+}
 
 eval "$(echo "$BOOTSTRAP_OUT" | sed -n '/===XRAY_AUTO_INSTALL_VARS===/,/===END===/p' | grep -E '^[A-Z_]+=' )"
 for v in UUID SHORT_ID PRIVATE_KEY PUBLIC_KEY DECRYPTION ENCRYPTION; do
@@ -460,14 +461,14 @@ log "Заливаю ssh-harden.sh..."
 scp_key "$WORKDIR/ssh-harden.sh" "root@${SERVER_IP}:/root/ssh-harden.sh"
 
 log "Применяю базовый sshd-hardening (X11Forwarding off, MaxAuthTries 3, LoginGraceTime 30)..."
-ssh_key "bash /root/ssh-harden.sh prep"
+PREP_OUT="$(ssh_key "bash /root/ssh-harden.sh prep" 2>&1)" || { echo "$PREP_OUT" >&2; die "prep-hardening упал (полный вывод выше)."; }
 
 log "Проверяю ключевой доступ новым соединением после prep..."
 ssh_key "echo ok" >/dev/null || die "SSH не поднялся после hardening-конфига — пароль ещё включён, чини руками."
 echo "  OK"
 
 log "Отключаю парольный вход (страховочный таймер на 3 мин, если что-то пойдёт не так)..."
-ssh_key "bash /root/ssh-harden.sh lockdown"
+LOCKDOWN_OUT="$(ssh_key "bash /root/ssh-harden.sh lockdown" 2>&1)" || { echo "$LOCKDOWN_OUT" >&2; die "lockdown упал (полный вывод выше)."; }
 
 log "Проверяю ключевой доступ новым соединением (пароль теперь должен быть отключён)..."
 if ssh_key "echo ok" >/dev/null 2>&1; then
@@ -555,7 +556,7 @@ sed -i "s/__SSH_PORT__/${SSH_PORT}/" "$WORKDIR/firewall.sh"
 
 log "Настраиваю nftables (открыты только ${SSH_PORT} и 443)..."
 scp_key "$WORKDIR/firewall.sh" "root@${SERVER_IP}:/root/firewall.sh"
-ssh_key "bash /root/firewall.sh apply"
+FIREWALL_OUT="$(ssh_key "bash /root/firewall.sh apply" 2>&1)" || { echo "$FIREWALL_OUT" >&2; die "firewall apply упал (полный вывод выше)."; }
 
 log "Проверяю доступ новым соединением после применения firewall..."
 if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" >/dev/null 2>&1; then
@@ -586,31 +587,13 @@ nftables, policy drop, открыты только:
   ${SSH_PORT}/tcp — SSH
   443/tcp — VLESS
 
-== Стек ==
-- Xray-core (последний стабильный релиз, установлен официальным скриптом XTLS/Xray-install)
-- BBR включён и персистентен
-- Конфиг: /usr/local/etc/xray/config.json
-- Локальная заглушка dest: nginx на 127.0.0.1:${DEST_PORT}, самоподписанный серт (CN=${SNI})
-
-== Протокол ==
-VLESS + XHTTP (транспорт) + Reality (маскировка) + Vision flow + постквантовое VLESS-шифрование
-UUID: ${UUID}
-SNI: ${SNI}
-shortId: ${SHORT_ID}
-Reality privateKey (сервер): ${PRIVATE_KEY}
-Reality publicKey (клиент): ${PUBLIC_KEY}
-
 == Ссылка ==
 ${VLESS_LINK}
 
 == Важно ==
-- fp=chrome не работал на некоторых мобильных клиентах, fp=firefox — рабочий вариант по умолчанию.
-  fp сознательно не рандомизируется (случайные ios/android/qq дают неправдоподобные
-  комбинации с реальным клиентом). Если firefox тоже начнёт резать — пробовать
-  safari/ios вручную (правь параметр fp= прямо в ссылке).
 - Нужен клиент с поддержкой VLESS Encryption (PQC): свежий v2rayNG/Happ/sing-box.
-- Отдельный sudo-пользователь, fail2ban и passphrase на ключе сознательно не настраивались
-  (при полной компрометации сервера/машины они не добавляют защиты — см. README).
+- Если ссылка перестанет подключаться — попробуй заменить fp=firefox на fp=safari
+  или fp=ios прямо в ссылке (см. README).
 EOF
 
 log "Готово!"

@@ -13,6 +13,11 @@
 # What it deliberately does NOT do (evaluated and rejected as low-value for this
 # threat model — see project README): create a separate sudo user, install
 # fail2ban, add swap, or set an SSH key passphrase.
+#
+# Robustness patterns below (dpkg-lock handling, competing sshd directives,
+# ssh.socket detection, nft syntax-check + timed auto-rollback) are ported from
+# github.com/RamDll/ovpn-stack's install/bootstrap.sh, where they were added
+# after real failures on fresh VPS images.
 
 set -euo pipefail
 
@@ -50,6 +55,7 @@ SSH_KEY_OPTS=(-o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -
 ssh_pw()  { sshpass -p "$ROOT_PASSWORD" ssh "${SSH_PW_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
 scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp -o StrictHostKeyChecking=accept-new -P "$SSH_PORT" "$@"; }
 ssh_key() { ssh "${SSH_KEY_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
+scp_key() { scp -o StrictHostKeyChecking=accept-new -i "$KEY_PATH" -P "$SSH_PORT" "$@"; }
 
 log "Проверяю парольный доступ к ${SERVER_IP}..."
 ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться по паролю. Проверь IP и пароль."
@@ -63,30 +69,111 @@ log "Собираю удалённый bootstrap-скрипт..."
 
 cat > "$WORKDIR/bootstrap.sh" <<'REMOTE_EOF'
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 SNI="__SNI__"
 DEST_PORT="__DEST_PORT__"
 
-echo "--- apt update / install базовых пакетов ---"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq curl unzip nginx openssl nftables ca-certificates >/dev/null
+log()  { printf '[bootstrap] %s\n' "$*"; }
+die()  { printf '[bootstrap] ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
-echo "--- BBR ---"
-modprobe tcp_bbr || true
-echo tcp_bbr > /etc/modules-load.d/bbr.conf
-cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a   # иначе needrestart на Debian может повиснуть на интерактивном списке служб
+
+APT_OPTS=(-o DPkg::Lock::Timeout=300 -o Dpkg::Options::=--force-confold)
+
+# Свежий VPS в первые минуты держит dpkg-lock под cloud-init/apt-daily/
+# unattended-upgrades. Останавливаем их таймеры — наш apt берёт lock сразу.
+stop_apt_daily() {
+  systemctl stop --no-block \
+    apt-daily.timer apt-daily-upgrade.timer \
+    apt-daily.service apt-daily-upgrade.service \
+    unattended-upgrades.service >/dev/null 2>&1 || true
+}
+wait_dpkg_lock() {
+  local w=0 max=180
+  while pgrep -x 'apt|apt-get|dpkg|aptitude|unattended-upgr|packagekitd' >/dev/null 2>&1 \
+     || fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; do
+    (( w >= max )) && { log "dpkg-lock ещё занят после ${max}с — пробую всё равно"; return 0; }
+    (( w % 20 == 0 )) && log "dpkg-lock занят (cloud-init?) — жду... ${w}/${max}с"
+    sleep 5; w=$((w + 5))
+  done
+  return 0
+}
+apt_do() {
+  local try
+  for try in 1 2 3; do
+    wait_dpkg_lock
+    if apt-get "${APT_OPTS[@]}" "$@"; then return 0; fi
+    log "apt-get $* — попытка $try не удалась, жду 20с и повторяю"
+    sleep 20
+  done
+  die "apt-get $* не прошёл после 3 попыток (dpkg-lock/сеть?)"
+}
+
+log "останавливаю apt-daily/unattended-upgrades, чтобы не воевали за dpkg-lock"
+stop_apt_daily
+wait_dpkg_lock
+dpkg --configure -a >/dev/null 2>&1 || true
+
+log "apt update"
+apt_do update -qq
+log "устанавливаю пакеты"
+apt_do -y install -qq curl unzip nginx openssl nftables ca-certificates >/dev/null
+systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+
+# Reality/TLS чувствителен к рассинхронизации часов — сертификаты и хендшейк
+# зависят от текущего времени. Если NTP уже синхронизирован или есть живой
+# демон — не трогаем, иначе включаем/ставим systemd-timesyncd.
+log "проверяю синхронизацию времени"
+ntp_ok() { [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" == yes ]]; }
+ntp_daemon_up() {
+  local s
+  for s in systemd-timesyncd chrony chronyd ntpsec ntpd openntpd; do
+    systemctl is-active --quiet "$s" 2>/dev/null && return 0
+  done
+  return 1
+}
+if ntp_ok || ntp_daemon_up; then
+  log "время уже синхронизировано"
+elif systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1; then
+  systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || log "не удалось включить timesyncd, продолжаю"
+else
+  apt_do -y install -qq systemd-timesyncd >/dev/null 2>&1 \
+    && systemctl enable --now systemd-timesyncd >/dev/null 2>&1 \
+    || log "не удалось поднять синхронизацию времени, продолжаю"
+fi
+for _ in $(seq 1 10); do ntp_ok && break; sleep 1; done
+ntp_ok || log "предупреждение: время ещё не синхронизировано, продолжаю всё равно"
+
+log "включаю BBR + fq qdisc"
+modprobe tcp_bbr 2>/dev/null || true
+if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+  echo tcp_bbr > /etc/modules-load.d/bbr.conf
+  cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
 net.core.default_qdisc=fq
 net.ipv4.tcp_congestion_control=bbr
 EOF
-sysctl --system >/dev/null 2>&1
+  sysctl -qp /etc/sysctl.d/99-bbr.conf
+else
+  log "BBR недоступен в этом ядре — остаюсь на cubic"
+fi
 
-echo "--- Xray-core (официальный установщик, latest stable release) ---"
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install >/dev/null
+log "Xray-core (официальный установщик, latest stable release)"
+XRAY_INSTALL_OK=0
+for try in 1 2 3; do
+  if bash -c "$(curl -fsSL --retry 3 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install >/dev/null 2>&1; then
+    XRAY_INSTALL_OK=1
+    break
+  fi
+  log "установка Xray-core — попытка $try не удалась, жду 10с и повторяю"
+  sleep 10
+done
+[[ "$XRAY_INSTALL_OK" == 1 ]] || die "не удалось установить Xray-core после 3 попыток"
+[ -x /usr/local/bin/xray ] || die "установщик отработал, но /usr/local/bin/xray не найден"
 /usr/local/bin/xray version | head -1
 
-echo "--- Генерация ключей ---"
+log "генерирую ключи"
 UUID=$(/usr/local/bin/xray uuid)
 SHORT_ID=$(openssl rand -hex 8)
 
@@ -106,7 +193,7 @@ ENCRYPTION=$(echo "$VLESSENC_OUT" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.
   exit 1
 }
 
-echo "--- Локальная заглушка dest (nginx на 127.0.0.1:${DEST_PORT}) ---"
+log "локальная заглушка dest (nginx на 127.0.0.1:${DEST_PORT})"
 mkdir -p /etc/nginx/fakesite-ssl
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout /etc/nginx/fakesite-ssl/key.pem -out /etc/nginx/fakesite-ssl/cert.pem \
@@ -127,7 +214,7 @@ nginx -t >/dev/null
 systemctl enable --now nginx >/dev/null 2>&1
 systemctl reload nginx
 
-echo "--- config.json ---"
+log "config.json"
 mkdir -p /usr/local/etc/xray
 cat > /usr/local/etc/xray/config.json <<EOF
 {
@@ -206,49 +293,202 @@ ssh_key "echo ok" >/dev/null || die "Ключевой доступ не зара
 echo "  OK"
 
 # ---------------------------------------------------------------------------
-# 3. SSH hardening — first the harmless bits (restart + verify with password
-#    still enabled as a safety net), THEN disable password auth and verify again.
+# 3. SSH hardening. One uploaded script, called twice with different stages:
+#    "prep" (harmless bits, password still enabled as a safety net) then
+#    "lockdown" (disable password). Each stage does, itself, on the server:
+#      - neutralize competing PasswordAuthentication/PermitRootLogin "yes"
+#        lines in OTHER config files (cloud-init's 50-cloud-init.conf is a
+#        known offender — sshd takes the FIRST matching directive, so a
+#        stray "yes" elsewhere can silently override our 00- drop-in)
+#      - `sshd -t` before restarting, abort+rollback the drop-in on failure
+#      - detect ssh.socket (Debian trixie can socket-activate ssh) and
+#        restart the right unit(s)
+#      - a local TCP self-check on 127.0.0.1:$port right after restart —
+#        fails fast with a clear message instead of a home-side timeout
+#      - `sshd -T` (authoritative effective config) to confirm what actually
+#        took effect, not just what we wrote
+#    "lockdown" additionally arms a systemd-run timer that reverts the
+#    password-disable drop-in after 3 minutes unless cancelled — cancelled
+#    only after this script confirms a brand-new key-based connection works.
 # ---------------------------------------------------------------------------
 
-log "Применяю базовый sshd-hardening (X11Forwarding off, MaxAuthTries 3, LoginGraceTime 30)..."
-ssh_key "cat > /etc/ssh/sshd_config.d/00-hardening.conf <<'EOF'
+cat > "$WORKDIR/ssh-harden.sh" <<'REMOTE_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+STAGE="${1:?usage: ssh-harden.sh prep|lockdown}"
+PORT=22
+
+log()  { printf '[ssh-harden] %s\n' "$*"; }
+die()  { printf '[ssh-harden] ОШИБКА: %s\n' "$*" >&2; exit 1; }
+
+backup_capped() {
+  local file="$1"
+  [[ -f "$file" ]] || return 0
+  cp -a "$file" "${file}.bak.$(date +%s)"
+  local old
+  mapfile -t old < <(ls -1t "${file}".bak.* 2>/dev/null | tail -n +4)
+  [[ ${#old[@]} -gt 0 ]] && rm -f -- "${old[@]}"
+}
+
+socket_active() {
+  systemctl list-unit-files ssh.socket >/dev/null 2>&1 && \
+    systemctl is-enabled --quiet ssh.socket 2>/dev/null
+}
+
+restart_ssh() {
+  systemctl daemon-reload
+  if socket_active; then
+    systemctl restart ssh.socket
+    systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true
+  else
+    systemctl restart ssh.service 2>/dev/null || systemctl restart sshd.service 2>/dev/null || systemctl restart ssh
+  fi
+}
+
+local_selfcheck() {
+  local up=0
+  for _ in $(seq 1 10); do
+    if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then exec 3<&- 3>&-; up=1; break; fi
+    sleep 1
+  done
+  [[ "$up" -eq 1 ]]
+}
+
+DROPIN_HARDENING=/etc/ssh/sshd_config.d/00-hardening.conf
+DROPIN_NOPASS=/etc/ssh/sshd_config.d/00-disable-password.conf
+
+if [[ "$STAGE" == "prep" ]]; then
+  backup_capped "$DROPIN_HARDENING"
+  cat > "$DROPIN_HARDENING" <<'EOF'
 X11Forwarding no
 MaxAuthTries 3
 LoginGraceTime 30
 EOF
-systemctl restart ssh 2>/dev/null || systemctl restart sshd"
 
-log "Проверяю ключевой доступ новым соединением после первого restart..."
-ssh_key "echo ok" >/dev/null || die "SSH не поднялся после hardening-конфига — пароль ещё включён, чини руками."
-echo "  OK"
+  log "проверяю синтаксис (sshd -t)"
+  if ! sshd -t; then
+    rm -f "$DROPIN_HARDENING"
+    die "sshd -t не прошёл — drop-in удалён, ничего не перезапускал"
+  fi
 
-log "Отключаю парольный вход..."
-ssh_key "cat > /etc/ssh/sshd_config.d/00-disable-password.conf <<'EOF'
+  restart_ssh
+  local_selfcheck || { rm -f "$DROPIN_HARDENING"; restart_ssh; die "ssh не слушает $PORT локально после restart — откатил и перезапустил"; }
+  log "prep готово: X11Forwarding/MaxAuthTries/LoginGraceTime применены, ssh слушает $PORT"
+
+elif [[ "$STAGE" == "lockdown" ]]; then
+  backup_capped "$DROPIN_NOPASS"
+  cat > "$DROPIN_NOPASS" <<'EOF'
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitRootLogin prohibit-password
 EOF
-systemctl restart ssh 2>/dev/null || systemctl restart sshd"
+
+  # sshd берёт ПЕРВОЕ вхождение директивы. Наши 00-* дроп-ины идут первыми
+  # по алфавиту, но если где-то (главный sshd_config, cloud-init) уже стоит
+  # `yes` РАНЬШЕ по include-порядку — она молча победит. Глушим все такие
+  # строки везде, кроме наших файлов.
+  cf_list=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)
+  for cf in "${cf_list[@]}"; do
+    [[ -f "$cf" && "$cf" != "$DROPIN_NOPASS" && "$cf" != "$DROPIN_HARDENING" ]] || continue
+    grep -qiE '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes' "$cf" || continue
+    backup_capped "$cf"
+    sed -ri 's/^([[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes.*)/# \1  # off: xray-auto-install/I' "$cf"
+    log "заглушил конкурирующую строку в $cf"
+  done
+
+  log "проверяю синтаксис (sshd -t)"
+  if ! sshd -t; then
+    rm -f "$DROPIN_NOPASS"
+    die "sshd -t не прошёл — drop-in удалён, пароль НЕ отключён"
+  fi
+
+  # страховочный таймер: если после restart ключ вдруг не пустит — сервер
+  # сам откатит запрет пароля через 3 минуты. Снимается ниже командой
+  # ssh-harden.sh confirm, вызываемой ТОЛЬКО после успешной проверки новым
+  # соединением с домашней машины.
+  systemd-run --unit=xray-auto-install-ssh-rollback --on-active=180 \
+    --description="xray-auto-install: откат отключения пароля, если не подтверждено" \
+    /bin/bash -c "rm -f ${DROPIN_NOPASS}; systemctl daemon-reload; systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true" \
+    >/dev/null 2>&1 || log "systemd-run недоступен — страховочный таймер не поставлен (действую без него)"
+
+  restart_ssh
+  if ! local_selfcheck; then
+    rm -f "$DROPIN_NOPASS"
+    restart_ssh
+    die "ssh не слушает $PORT локально после restart — откатил отключение пароля"
+  fi
+
+  sshd_eff="$(sshd -T 2>/dev/null || true)"
+  pw_eff="$(awk '$1=="passwordauthentication"{print $2}' <<<"$sshd_eff")"
+  root_eff="$(awk '$1=="permitrootlogin"{print $2}' <<<"$sshd_eff")"
+  if [[ "$pw_eff" != "no" ]]; then
+    log "ВНИМАНИЕ: sshd -T показывает passwordauthentication=$pw_eff — пароль НЕ отключён эффективно."
+    log "Конкурирующие строки (проверь руками):"
+    grep -rniE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null || true
+  else
+    log "lockdown готово: sshd -T подтверждает passwordauthentication=no, permitrootlogin=$root_eff"
+  fi
+
+elif [[ "$STAGE" == "confirm" ]]; then
+  systemctl stop xray-auto-install-ssh-rollback.timer >/dev/null 2>&1 || true
+  systemctl reset-failed xray-auto-install-ssh-rollback.service >/dev/null 2>&1 || true
+  log "страховочный таймер снят — отключение пароля подтверждено"
+else
+  die "неизвестный STAGE: $STAGE"
+fi
+REMOTE_EOF
+
+log "Заливаю ssh-harden.sh..."
+scp_key "$WORKDIR/ssh-harden.sh" "root@${SERVER_IP}:/root/ssh-harden.sh"
+
+log "Применяю базовый sshd-hardening (X11Forwarding off, MaxAuthTries 3, LoginGraceTime 30)..."
+ssh_key "bash /root/ssh-harden.sh prep"
+
+log "Проверяю ключевой доступ новым соединением после prep..."
+ssh_key "echo ok" >/dev/null || die "SSH не поднялся после hardening-конфига — пароль ещё включён, чини руками."
+echo "  OK"
+
+log "Отключаю парольный вход (страховочный таймер на 3 мин, если что-то пойдёт не так)..."
+ssh_key "bash /root/ssh-harden.sh lockdown"
 
 log "Проверяю ключевой доступ новым соединением (пароль теперь должен быть отключён)..."
-ssh_key "echo ok" >/dev/null || die "SSH не поднялся после отключения пароля! Доступ по паролю уже выключен — используй консоль провайдера."
-echo "  OK — парольный вход отключён, ключ работает."
+if ssh_key "echo ok" >/dev/null 2>&1; then
+  ssh_key "bash /root/ssh-harden.sh confirm; rm -f /root/ssh-harden.sh"
+  echo "  OK — парольный вход отключён, ключ работает, страховочный таймер снят."
+else
+  warn "Новое соединение не удалось! Если это был временный сбой — попробуй ssh руками в ближайшие 3 минуты."
+  warn "Если не получится — сервер сам откатит отключение пароля через страховочный таймер (systemd-run, 3 мин)."
+  die "Останавливаюсь, не продолжаю на firewall без подтверждённого SSH."
+fi
 
 # ---------------------------------------------------------------------------
 # 4. Firewall (nftables): only 22/tcp and 443/tcp, policy drop.
-#    Safety net: a background job reverts to allow-all if we don't cancel it
-#    within 2 minutes (protects against a typo locking us out).
+#    `nft -c -f` validates syntax before touching the live ruleset. A
+#    systemd-run timer reverts to allow-all after 2 minutes unless cancelled
+#    — cancelled only after a brand-new SSH connection confirms access.
 # ---------------------------------------------------------------------------
 
-log "Настраиваю nftables (открыты только 22 и 443)..."
-ssh_key "cat > /etc/nftables.conf <<'EOF'
+cat > "$WORKDIR/firewall.sh" <<'REMOTE_EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+STAGE="${1:?usage: firewall.sh apply|confirm}"
+SSH_PORT="__SSH_PORT__"
+
+log()  { printf '[firewall] %s\n' "$*"; }
+die()  { printf '[firewall] ОШИБКА: %s\n' "$*" >&2; exit 1; }
+
+if [[ "$STAGE" == "apply" ]]; then
+  command -v nft >/dev/null 2>&1 || die "nft не найден (nftables не установлен)"
+
+  RENDERED="$(mktemp)"
+  cat > "$RENDERED" <<EOF
 #!/usr/sbin/nft -f
 flush ruleset
 
 table inet filter {
     chain input {
         type filter hook input priority filter; policy drop;
-        iif \"lo\" accept
+        iif "lo" accept
         ct state established,related accept
         ct state invalid drop
         icmp type { destination-unreachable, echo-request, time-exceeded } accept
@@ -264,17 +504,48 @@ table inet filter {
     }
 }
 EOF
-nohup bash -c 'sleep 120 && nft flush ruleset' >/dev/null 2>&1 & disown
-echo \$! > /root/.xray-auto-install-fw-failsafe.pid
-nft -f /etc/nftables.conf
-systemctl enable nftables >/dev/null 2>&1"
+
+  log "проверяю синтаксис (nft -c -f)"
+  nft -c -f "$RENDERED" || { rm -f "$RENDERED"; die "nft -c -f не прошёл, ничего не применяю"; }
+
+  install -m 0644 "$RENDERED" /etc/nftables.conf
+  rm -f "$RENDERED"
+
+  systemd-run --unit=xray-auto-install-fw-rollback --on-active=120 \
+    --description="xray-auto-install: откат firewall, если не подтверждено" \
+    /bin/bash -c "nft flush ruleset" >/dev/null 2>&1 \
+    || log "systemd-run недоступен — страховочный таймер не поставлен (действую без него)"
+
+  log "применяю ruleset"
+  nft -f /etc/nftables.conf || { nft flush ruleset; die "nft -f упал — откатил (flush ruleset)"; }
+  systemctl enable nftables >/dev/null 2>&1 || true
+
+  systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 ' \
+    || log "предупреждение: xray/443 не выглядят активными после применения firewall"
+  log "firewall применён — жду confirm с домашней машины (иначе откат через 2 мин)"
+
+elif [[ "$STAGE" == "confirm" ]]; then
+  systemctl stop xray-auto-install-fw-rollback.timer >/dev/null 2>&1 || true
+  systemctl reset-failed xray-auto-install-fw-rollback.service >/dev/null 2>&1 || true
+  log "страховочный таймер снят — firewall подтверждён"
+else
+  die "неизвестный STAGE: $STAGE"
+fi
+REMOTE_EOF
+
+sed -i "s/__SSH_PORT__/${SSH_PORT}/" "$WORKDIR/firewall.sh"
+
+log "Настраиваю nftables (открыты только ${SSH_PORT} и 443)..."
+scp_key "$WORKDIR/firewall.sh" "root@${SERVER_IP}:/root/firewall.sh"
+ssh_key "bash /root/firewall.sh apply"
 
 log "Проверяю доступ новым соединением после применения firewall..."
-if ssh_key "kill \$(cat /root/.xray-auto-install-fw-failsafe.pid) 2>/dev/null; rm -f /root/.xray-auto-install-fw-failsafe.pid; systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" ; then
-  echo "  OK — SSH и xray живы после применения firewall, failsafe-таймер отменён."
+if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" >/dev/null 2>&1; then
+  ssh_key "bash /root/firewall.sh confirm; rm -f /root/firewall.sh"
+  echo "  OK — SSH и xray живы после применения firewall, страховочный таймер отменён."
 else
   warn "Не удалось подтвердить состояние после firewall новым соединением!"
-  warn "Через 2 минуты сработает failsafe и правила сбросятся сами (nft flush ruleset)."
+  warn "Через 2 минуты сработает страховочный таймер и правила сбросятся сами (nft flush ruleset)."
 fi
 
 # ---------------------------------------------------------------------------

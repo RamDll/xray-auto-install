@@ -67,12 +67,12 @@ WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
 SSH_PW_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15)
-SSH_KEY_OPTS=(-o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o ConnectTimeout=15 -i "$KEY_PATH")
+SSH_KEY_OPTS=(-o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o IdentitiesOnly=yes -o ConnectTimeout=15 -i "$KEY_PATH")
 
 ssh_pw()  { sshpass -p "$ROOT_PASSWORD" ssh "${SSH_PW_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
-scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp -o StrictHostKeyChecking=accept-new -P "$SSH_PORT" "$@"; }
+scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -P "$SSH_PORT" "$@"; }
 ssh_key() { ssh "${SSH_KEY_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
-scp_key() { scp -o StrictHostKeyChecking=accept-new -i "$KEY_PATH" -P "$SSH_PORT" "$@"; }
+scp_key() { scp -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$KEY_PATH" -P "$SSH_PORT" "$@"; }
 
 log "Проверяю парольный доступ к ${SERVER_IP}..."
 ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться по паролю. Проверь IP и пароль."

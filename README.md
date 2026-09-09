@@ -20,9 +20,20 @@
    исключает pre-release теги), с ретраями на случай сетевого сбоя.
 4. Генерирует UUID, X25519-пару (Reality) и постквантовую VLESS-пару шифрования
    (`mlkem768x25519plus`) через `xray vlessenc`.
-5. Поднимает локальную заглушку под Reality `dest` — nginx на `127.0.0.1:8444`
-   с самоподписанным сертификатом (`CN=www.microsoft.com`). Заглушка не торчит
-   наружу, доп. проброса портов не требует.
+5. Выбирает Reality SNI случайно из пула 16 крупных tech-доменов
+   (`www.microsoft.com`, `www.bing.com`, `www.samsung.com`, `www.nvidia.com`,
+   `www.amd.com`, `www.intel.com`, `www.cloudflare.com`, `cdn.jsdelivr.net`,
+   `www.tesla.com`, `www.sap.com`, `www.oracle.com`, `www.dell.com`,
+   `www.lenovo.com`, `www.cisco.com`, `www.qualcomm.com`, `www.hp.com`) — свой
+   при каждом запуске, а не один фиксированный домен на все инсталляции этого
+   скрипта. Список без apple/icloud: Xray-core сам пишет в лог `REALITY:
+   Choosing apple, icloud, etc. as the target may get your IP blocked by the
+   GFW` — это хардкод-проверка внутри движка, не наша догадка (найдено на
+   живом сервере в ovpn-stack, см. его `install/NOTES.md`). `dest` при этом
+   локальный — nginx на `127.0.0.1:8444` с самоподписанным сертификатом на
+   выбранный домен. Заглушка не торчит наружу, доп. проброса портов не
+   требует, и её домену не нужно быть реально доступным в интернете — сервер
+   к нему не ходит.
 6. Пишет `/usr/local/etc/xray/config.json`: VLESS + XHTTP (транспорт) + Reality
    (маскировка) + `xtls-rprx-vision` (flow) + PQC-шифрование. Именно эта
    комбинация требует PQC — `encryption: none` с `xhttp`+`vision` не работает
@@ -66,7 +77,7 @@ socket-activated SSH, автооткат по таймеру) унаследов
 На выходе — ссылка вида:
 
 ```
-vless://<uuid>@<ip>:443?encryption=mlkem768x25519plus...&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=firefox&pbk=...&sid=...&spx=%2F&type=xhttp#xray-auto-install
+vless://<uuid>@<ip>:443?encryption=mlkem768x25519plus...&flow=xtls-rprx-vision&security=reality&sni=<random-domain-from-pool>&fp=firefox&pbk=...&sid=...&spx=%2F&type=xhttp#xray-auto-install
 ```
 
 Нужен клиент с поддержкой VLESS Encryption (PQC) — свежие v2rayNG / Happ /

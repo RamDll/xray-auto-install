@@ -40,7 +40,24 @@ echo
 [ -n "$ROOT_PASSWORD" ] || die "Пароль не может быть пустым."
 
 SSH_PORT=22
-SNI="www.microsoft.com"          # тестировался и подтверждён рабочим на 138.124.71.35
+# Пул крупных доменов для Reality serverName. dest у нас локальный (см. ниже),
+# сервер к этим доменам не ходит — их реальная доступность/TLS-стек не важны,
+# роль чисто визуальная (что видно в ClientHello/самоподписанном серте).
+# Один и тот же SNI у всех, кто запустит этот скрипт, — лишний признак для
+# массового сканирования, поэтому выбираем случайно из пула при каждом
+# запуске, а не жёстко фиксируем один домен.
+# Без apple/icloud: Xray-core сам пишет в лог «REALITY: Choosing apple,
+# icloud, etc. as the target may get your IP blocked by the GFW» — это
+# хардкод-проверка внутри движка, не наша догадка (см. github.com/RamDll/
+# ovpn-stack install/NOTES.md). Список доменов — оттуда же (ovpn-stack
+# SNI_POOL), уже отобран с учётом этого исключения.
+SNI_POOL=(
+  www.microsoft.com  www.bing.com       www.samsung.com    www.nvidia.com
+  www.amd.com        www.intel.com      www.cloudflare.com cdn.jsdelivr.net
+  www.tesla.com       www.sap.com        www.oracle.com     www.dell.com
+  www.lenovo.com      www.cisco.com      www.qualcomm.com   www.hp.com
+)
+SNI="${SNI_POOL[RANDOM % ${#SNI_POOL[@]}]}"
 FP="firefox"                     # fp=chrome не заработал на реальном мобильном клиенте, firefox — заработал
 DEST_PORT=8444
 IP_SLUG="$(echo "$SERVER_IP" | tr '.:' '_')"
@@ -60,6 +77,7 @@ scp_key() { scp -o StrictHostKeyChecking=accept-new -i "$KEY_PATH" -P "$SSH_PORT
 log "Проверяю парольный доступ к ${SERVER_IP}..."
 ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться по паролю. Проверь IP и пароль."
 echo "  OK"
+echo "  Reality SNI (случайно из пула): ${SNI}"
 
 # ---------------------------------------------------------------------------
 # 1. Remote bootstrap: packages, BBR, Xray-core, keys, fakesite, config.json

@@ -428,17 +428,22 @@ systemctl is-active --quiet xray || { echo "xray не запустился" >&2;
 ss -ltnp | grep -q ':443 ' || { echo "порт 443 не слушается" >&2; exit 1; }
 # retry: сразу после `enable --now` + `reload` nginx иногда ловит короткое
 # окно, когда TLS-листенер ещё не до конца поднялся (SSL_do_handshake failed
-# / unexpected ccs message в error.log) — поймано вживую, через 1-2с само
-# проходит, единичная проверка тут даёт ложный негатив.
+# / unexpected ccs message в error.log). Обычно проходит за 1-2с, но на
+# свежепереустановленном VPS ловилось окно >6с — старого бюджета 5×1с не
+# хватало, и установка падала уже после успешной настройки xray. Даём ~1 мин
+# и дважды пинаем nginx полным рестартом (не reload).
 FAKESITE_OK=0
-for try in 1 2 3 4 5; do
+systemctl restart nginx 2>/dev/null || true
+sleep 3
+for try in $(seq 1 30); do
   if curl -sk "https://127.0.0.1:${DEST_PORT}/" 2>/dev/null | grep -q "Meridian"; then
     FAKESITE_OK=1
     break
   fi
-  sleep 1
+  [ "$try" = 10 ] && { systemctl restart nginx 2>/dev/null || true; }
+  sleep 2
 done
-[[ "$FAKESITE_OK" == 1 ]] || { echo "fakesite не отвечает после 5 попыток" >&2; exit 1; }
+[[ "$FAKESITE_OK" == 1 ]] || { echo "fakesite не отвечает после 30 попыток" >&2; exit 1; }
 
 echo "===XRAY_AUTO_INSTALL_VARS==="
 echo "UUID=${UUID}"

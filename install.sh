@@ -133,6 +133,11 @@ set -Eeuo pipefail
 
 log()  { printf '[bootstrap] %s\n' "$*"; }
 die()  { printf '[bootstrap] ОШИБКА: %s\n' "$*" >&2; exit 1; }
+# Любая неожиданная ошибка — с номером строки, а не молчаливый выход по set -e.
+# Только $LINENO, без $BASH_COMMAND: упавшая команда может содержать тайны
+# (например, sed внутри redact() с приватным ключом в шаблоне). set -E
+# наследует ловушку в функции; в условиях (if, ||, &&) она не срабатывает.
+trap 'die "неожиданная ошибка в строке $LINENO bootstrap.sh (вывод выше)"' ERR
 
 # Поддерживаются Debian 12+ и Ubuntu 22.04+. Проверка SSH по `sshd -T`
 # строгая, а OpenSSH < 8.7 (Debian 11, Ubuntu 20.04) печатает там другие
@@ -182,6 +187,45 @@ apt_do() {
   done
   die "apt-get $* не прошёл после 3 попыток (dpkg-lock/сеть?)"
 }
+
+# Своп по объёму RAM: < 2 GiB → 2 GiB, 2–4 GiB → 1 GiB, > 4 GiB → не нужен.
+# Первым шагом, ДО apt: dist-upgrade — самый тяжёлый по памяти шаг установки,
+# и на ~1 GB VPS он должен идти уже с подушкой. Нужны только coreutils/
+# util-linux из базового образа.
+# Это подушка от OOM-killer'а на маленьких VPS (130.17.21.198: 967MB без
+# свопа), а не рабочая память. MemTotal у «2GB»-тарифа чуть меньше 2 GiB
+# (ядро резервирует часть) — такой VPS честно попадает в первую ступень.
+# В LXC/OpenVZ swapon запрещён — это предупреждение, не ошибка: без свопа
+# сервис работает, просто без подушки.
+MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+if   (( MEM_KB < 2 * 1024 * 1024 )); then SWAP_MB=2048
+elif (( MEM_KB <= 4 * 1024 * 1024 )); then SWAP_MB=1024
+else SWAP_MB=0
+fi
+if swapon --show | grep -q .; then
+  log "своп уже есть — пропускаю"
+elif (( SWAP_MB == 0 )); then
+  log "RAM $((MEM_KB / 1024))MB > 4 GiB — своп не создаю"
+else
+  log "своп ${SWAP_MB}MB (RAM $((MEM_KB / 1024))MB)"
+  # fallocate не везде даёт файл, годный для свопа (не поддерживается ФС) —
+  # тогда честная запись нулями через dd.
+  rm -f /swapfile
+  if ! fallocate -l "${SWAP_MB}M" /swapfile 2>/dev/null; then
+    log "fallocate не сработал — создаю своп через dd"
+    rm -f /swapfile
+    dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_MB" status=none
+  fi
+  chmod 600 /swapfile
+  if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+    sysctl -qp /etc/sysctl.d/99-swappiness.conf
+  else
+    log "ПРЕДУПРЕЖДЕНИЕ: swapon не разрешён (LXC/OpenVZ?) — продолжаю без свопа"
+    rm -f /swapfile
+  fi
+fi
 
 log "останавливаю apt-daily/unattended-upgrades, чтобы не воевали за dpkg-lock"
 stop_apt_daily
@@ -287,42 +331,6 @@ fi
 REALITY_TARGET="${REALITY_SNI}:443"
 log "Reality target: ${REALITY_TARGET}"
 
-# Своп по объёму RAM: < 2 GiB → 2 GiB, 2–4 GiB → 1 GiB, > 4 GiB → не нужен.
-# Это подушка от OOM-killer'а на маленьких VPS (130.17.21.198: 967MB без
-# свопа), а не рабочая память. MemTotal у «2GB»-тарифа чуть меньше 2 GiB
-# (ядро резервирует часть) — такой VPS честно попадает в первую ступень.
-# В LXC/OpenVZ swapon запрещён — это предупреждение, не ошибка: без свопа
-# сервис работает, просто без подушки.
-MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
-if   (( MEM_KB < 2 * 1024 * 1024 )); then SWAP_MB=2048
-elif (( MEM_KB <= 4 * 1024 * 1024 )); then SWAP_MB=1024
-else SWAP_MB=0
-fi
-if swapon --show | grep -q .; then
-  log "своп уже есть — пропускаю"
-elif (( SWAP_MB == 0 )); then
-  log "RAM $((MEM_KB / 1024))MB > 4 GiB — своп не создаю"
-else
-  log "своп ${SWAP_MB}MB (RAM $((MEM_KB / 1024))MB)"
-  # fallocate не везде даёт файл, годный для свопа (не поддерживается ФС) —
-  # тогда честная запись нулями через dd.
-  rm -f /swapfile
-  if ! fallocate -l "${SWAP_MB}M" /swapfile 2>/dev/null; then
-    log "fallocate не сработал — создаю своп через dd"
-    rm -f /swapfile
-    dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_MB" status=none
-  fi
-  chmod 600 /swapfile
-  if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
-    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
-    sysctl -qp /etc/sysctl.d/99-swappiness.conf
-  else
-    log "ПРЕДУПРЕЖДЕНИЕ: swapon не разрешён (LXC/OpenVZ?) — продолжаю без свопа"
-    rm -f /swapfile
-  fi
-fi
-
 log "включаю BBR + fq qdisc"
 modprobe tcp_bbr 2>/dev/null || true
 if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
@@ -374,8 +382,10 @@ SHORT_ID=$(openssl rand -hex 8)
 # захватываем вместе со stderr и НИКОГДА не печатаем, даже при ошибке.
 X25519_OUT="$(/usr/local/bin/xray x25519 2>&1)" \
   || die "xray x25519 завершился с ошибкой (Xray ${XRAY_VER:-?}); вывод не печатаю — в нём ключи"
-PRIVATE_KEY=$(grep -iE '^Private ?key' <<<"$X25519_OUT" | sed -E 's/^[^:]+:\s*//')
-PUBLIC_KEY=$(grep -iE '^Public ?key|^Password' <<<"$X25519_OUT" | sed -n '1s/^[^:]*:[[:space:]]*//p')
+# `|| true`: если формат вывода сменился и grep ничего не нашёл, под pipefail
+# подстановка упала бы и set -e завершил бы скрипт ДО понятной проверки ниже.
+PRIVATE_KEY=$(grep -iE '^Private ?key' <<<"$X25519_OUT" | sed -E 's/^[^:]+:\s*//' || true)
+PUBLIC_KEY=$(grep -iE '^Public ?key|^Password' <<<"$X25519_OUT" | sed -n '1s/^[^:]*:[[:space:]]*//p' || true)
 
 # `xray vlessenc` печатает ДВА варианта. В ОБОИХ обмен ключами один и тот же —
 # гибридный ML-KEM-768 + X25519, эфемерный (отсюда "Ephemeral key exchange is
@@ -396,8 +406,8 @@ PUBLIC_KEY=$(grep -iE '^Public ?key|^Password' <<<"$X25519_OUT" | sed -n '1s/^[^
 VLESSENC_OUT="$(/usr/local/bin/xray vlessenc 2>&1)" \
   || die "xray vlessenc завершился с ошибкой (Xray ${XRAY_VER:-?}); вывод не печатаю — в нём ключи"
 VLESSENC_X25519=$(awk '/ML-KEM-768/{exit} {print}' <<<"$VLESSENC_OUT")
-DECRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p)
-ENCRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p)
+DECRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p || true)
+ENCRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p || true)
 unset X25519_OUT VLESSENC_OUT VLESSENC_X25519
 
 [ -n "$UUID" ] && [ -n "$SHORT_ID" ] && [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] \
@@ -744,7 +754,11 @@ LOCKDOWN_OUT="$(ssh_key "XAI_TEST_BREAK_SSH=${XAI_TEST_BREAK_SSH} bash /root/ssh
 
 log "Проверяю ключевой доступ новым соединением (пароль теперь должен быть отключён)..."
 if ssh_key "echo ok" >/dev/null 2>&1; then
-  ssh_key "bash /root/ssh-harden.sh confirm; rm -f /root/ssh-harden.sh"
+  # Обрыв ровно на подтверждении не должен означать молчаливый выход по set -e:
+  # таймер тогда всё равно откатит — говорим об этом прямо.
+  ssh_key "bash /root/ssh-harden.sh confirm && rm -f /root/ssh-harden.sh" \
+    || die "Не удалось снять страховочный таймер SSH (обрыв соединения?). Через 3 минуты сервер
+сам удалит наш SSH drop-in — вернётся вход по паролю; после этого запусти скрипт повторно."
   echo "  OK — парольный вход отключён, ключ работает, страховочный таймер снят."
 else
   warn "Новое соединение по ключу не удалось!"
@@ -873,7 +887,10 @@ FIREWALL_OUT="$(ssh_key "XAI_TEST_BREAK_FW=${XAI_TEST_BREAK_FW} bash /root/firew
 
 log "Проверяю доступ новым соединением после применения firewall..."
 if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" >/dev/null 2>&1; then
-  ssh_key "bash /root/firewall.sh confirm; rm -f /root/firewall.sh"
+  ssh_key "bash /root/firewall.sh confirm && rm -f /root/firewall.sh" \
+    || die "Не удалось снять страховочный таймер firewall (обрыв соединения?). Через 2 минуты
+фильтрация будет снята (nft flush + disable nftables), ссылку не выдаю.
+Вход: ssh -i '${KEY_PATH}' -o UserKnownHostsFile='${KNOWN_HOSTS}' -o StrictHostKeyChecking=yes root@${SERVER_IP}"
   echo "  OK — SSH и xray живы после применения firewall, страховочный таймер отменён."
 else
   warn "Не удалось подтвердить доступ после firewall новым соединением!"

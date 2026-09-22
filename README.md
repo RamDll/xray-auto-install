@@ -26,7 +26,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/RamDll/xray-auto-install/main
    dpkg-lock на свежем VPS), чинит незавершённый `dpkg` прошлых прогонов,
    делает `apt dist-upgrade` (обновляет уже установленные системные пакеты —
    свежий образ провайдера может нести старые версии с известными дырами),
-   ставит нужные пакеты (`curl unzip nginx openssl nftables`) с ретраями,
+   ставит нужные пакеты (`curl unzip openssl nftables`) с ретраями,
    проверяет синхронизацию времени (важно для TLS/Reality) — все apt-вызовы
    идут с ожиданием dpkg-lock и тремя попытками.
 2. Включает BBR (персистентно, переживает перезагрузку).
@@ -43,25 +43,18 @@ bash <(wget -qO- https://raw.githubusercontent.com/RamDll/xray-auto-install/main
    ML-KEM-768 даёт лишь дополнительную алгоритмическую стойкость ценой размера
    ссылки. Это тот же вариант, что был в изначальной, вручную протестированной
    и подтверждённой конфигурации 138.124.71.35.
-5. Выбирает Reality SNI случайно из пула 16 крупных tech-доменов
-   (`www.microsoft.com`, `www.bing.com`, `www.samsung.com`, `www.nvidia.com`,
-   `www.amd.com`, `www.intel.com`, `www.cloudflare.com`, `cdn.jsdelivr.net`,
+5. Выбирает Reality SNI/target **на сервере**, после синхронизации времени:
+   перемешивает пул крупных доменов (`www.microsoft.com`, `www.bing.com`,
+   `www.samsung.com`, `www.nvidia.com`, `www.amd.com`, `www.intel.com`,
    `www.tesla.com`, `www.sap.com`, `www.oracle.com`, `www.dell.com`,
-   `www.lenovo.com`, `www.cisco.com`, `www.qualcomm.com`, `www.hp.com`) — свой
-   при каждом запуске, а не один фиксированный домен на все инсталляции этого
-   скрипта. Список без apple/icloud: Xray-core сам пишет в лог `REALITY:
-   Choosing apple, icloud, etc. as the target may get your IP blocked by the
-   GFW` — это хардкод-проверка внутри движка, не наша догадка (найдено на
-   живом сервере в ovpn-stack, см. его `install/NOTES.md`). `dest` при этом
-   локальный — nginx на `127.0.0.1:8444` с самоподписанным сертификатом на
-   выбранный домен. Заглушка не торчит наружу, доп. проброса портов не
-   требует, и её домену не нужно быть реально доступным в интернете — сервер
-   к нему не ходит. Отдаёт не голый `return 200 "OK"`, а настоящую HTML-
-   страницу (статус-страница в духе Statuspage/Instatus — "All systems
-   operational") — если кто-то зайдёт на dest без валидной REALITY-
-   авторизации, увидит правдоподобный нейтральный сайт, а не явный признак
-   VPN-заглушки. Жанр нейтральный специально — не привязан ни к какому
-   конкретному бренду, подходит под любой SNI из пула.
+   `www.lenovo.com`, `www.cisco.com`, `www.qualcomm.com`, `www.hp.com`) и
+   берёт первый, к которому с этого VPS проходит TLS 1.3 + X25519 с валидным
+   сертификатом и согласованным h2. `target` — этот же реальный сайт
+   (`<домен>:443`): неавторизованный клиент видит его настоящий сертификат,
+   а не заглушку. Без apple/icloud (Xray-core сам предупреждает: `Choosing
+   apple, icloud, etc. as the target may get your IP blocked by the GFW`) и
+   без CDN-фронтов cloudflare/jsdelivr. Если не прошёл ни один домен —
+   установка останавливается с подсказкой (DNS / время / исходящий 443).
 6. Пишет `/usr/local/etc/xray/config.json`: VLESS + XHTTP (транспорт) + Reality
    (маскировка) + `xtls-rprx-vision` (flow) + VLESS Encryption. Именно
    какая-то форма VLESS Encryption тут обязательна — `encryption: none` с
@@ -170,7 +163,6 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
 ## Файлы на сервере после установки
 
 - `/usr/local/etc/xray/config.json` — конфиг Xray-core
-- `/etc/nginx/conf.d/fakesite.conf` + `/etc/nginx/fakesite-ssl/` — заглушка dest
 - `/etc/nftables.conf` — правила фаервола
 - `/etc/ssh/sshd_config.d/00-hardening.conf`, `00-disable-password.conf`
 - `/etc/sysctl.d/99-bbr.conf`, `/etc/modules-load.d/bbr.conf` — BBR

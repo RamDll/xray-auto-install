@@ -8,9 +8,9 @@
 # Usage:
 #   ./install.sh
 # It asks for exactly two things: server IP and the root password issued by the
-# provider. Everything else (packages, BBR, Xray-core, keys, local Reality "dest"
-# stub, SSH hardening, firewall) is automatic and mirrors the manual setup that was
-# tested end-to-end (including a full reboot) on 2026-09-09.
+# provider. Everything else (packages, BBR, Xray-core, keys, external Reality
+# target picked and TLS-checked from the server, SSH hardening, firewall) is
+# automatic.
 #
 # What it deliberately does NOT do (evaluated and rejected as low-value for this
 # threat model — see project README): create a separate sudo user, install
@@ -44,26 +44,10 @@ echo
 [ -n "$ROOT_PASSWORD" ] || die "Пароль не может быть пустым."
 
 SSH_PORT=22
-# Пул крупных доменов для Reality serverName. dest у нас локальный (см. ниже),
-# сервер к этим доменам не ходит — их реальная доступность/TLS-стек не важны,
-# роль чисто визуальная (что видно в ClientHello/самоподписанном серте).
-# Один и тот же SNI у всех, кто запустит этот скрипт, — лишний признак для
-# массового сканирования, поэтому выбираем случайно из пула при каждом
-# запуске, а не жёстко фиксируем один домен.
-# Без apple/icloud: Xray-core сам пишет в лог «REALITY: Choosing apple,
-# icloud, etc. as the target may get your IP blocked by the GFW» — это
-# хардкод-проверка внутри движка, не наша догадка (см. github.com/RamDll/
-# ovpn-stack install/NOTES.md). Список доменов — оттуда же (ovpn-stack
-# SNI_POOL), уже отобран с учётом этого исключения.
-SNI_POOL=(
-  www.microsoft.com  www.bing.com       www.samsung.com    www.nvidia.com
-  www.amd.com        www.intel.com      www.cloudflare.com cdn.jsdelivr.net
-  www.tesla.com       www.sap.com        www.oracle.com     www.dell.com
-  www.lenovo.com      www.cisco.com      www.qualcomm.com   www.hp.com
-)
-SNI="${SNI_POOL[RANDOM % ${#SNI_POOL[@]}]}"
+# Reality SNI/target выбирается на сервере (bootstrap, после NTP), а не здесь:
+# годность target проверяется TLS-хендшейком С САМОГО VPS — важна его сеть,
+# его DNS и его часы, а не домашней машины.
 FP="firefox"                     # fp=chrome не заработал на реальном мобильном клиенте, firefox — заработал
-DEST_PORT=8444
 IP_SLUG="$(echo "$SERVER_IP" | tr '.:' '_')"
 KEY_PATH="$HOME/.ssh/xray-auto-install-${IP_SLUG}"
 SUMMARY_FILE="$HOME/xray-auto-install-${IP_SLUG}-summary.txt"
@@ -92,10 +76,9 @@ ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться
 парольный вход уже отключён (в т.ч. этим же скриптом ранее): повторно так не поставить, нужен свежий root-пароль
 от провайдера — переустанови ОС в его панели и запусти скрипт заново."
 echo "  OK"
-echo "  Reality SNI (случайно из пула): ${SNI}"
 
 # ---------------------------------------------------------------------------
-# 1. Remote bootstrap: packages, BBR, Xray-core, keys, fakesite, config.json
+# 1. Remote bootstrap: packages, BBR, Reality target, Xray-core, keys, config.json
 # ---------------------------------------------------------------------------
 
 log "Собираю удалённый bootstrap-скрипт..."
@@ -103,9 +86,6 @@ log "Собираю удалённый bootstrap-скрипт..."
 cat > "$WORKDIR/bootstrap.sh" <<'REMOTE_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-
-SNI="__SNI__"
-DEST_PORT="__DEST_PORT__"
 
 log()  { printf '[bootstrap] %s\n' "$*"; }
 die()  { printf '[bootstrap] ОШИБКА: %s\n' "$*" >&2; exit 1; }
@@ -154,10 +134,10 @@ apt_do update -qq
 log "apt dist-upgrade"
 apt_do -y dist-upgrade -qq >/dev/null
 log "устанавливаю пакеты"
-apt_do -y install -qq curl unzip nginx openssl nftables ca-certificates >/dev/null
+apt_do -y install -qq curl unzip openssl nftables ca-certificates >/dev/null
 systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
-log "ограничиваю journald (SystemMaxUse=100M), иначе на слабом VPS лог xray/nginx может забить диск"
+log "ограничиваю journald (SystemMaxUse=100M), иначе на слабом VPS лог xray может забить диск"
 sed -i 's/^#\?SystemMaxUse=.*/SystemMaxUse=100M/' /etc/systemd/journald.conf
 grep -q '^SystemMaxUse=' /etc/systemd/journald.conf || echo 'SystemMaxUse=100M' >> /etc/systemd/journald.conf
 systemctl restart systemd-journald
@@ -185,6 +165,46 @@ else
 fi
 for _ in $(seq 1 10); do ntp_ok && break; sleep 1; done
 ntp_ok || log "предупреждение: время ещё не синхронизировано, продолжаю всё равно"
+
+# Reality target — настоящий внешний сайт: неавторизованный клиент (сканер,
+# браузер) получает его подлинный сертификат и ответ, а не самоподписанную
+# заглушку. Проверка идёт ПОСЛЕ NTP: -verify_return_error валит хендшейк при
+# сбитых часах, и хороший кандидат был бы отброшен зря.
+# Без apple/icloud: Xray-core сам предупреждает в логе «Choosing apple,
+# icloud, etc. as the target may get your IP blocked by the GFW». Без
+# cloudflare/jsdelivr: это CDN-фронты, их сертификат и поведение слишком
+# сильно зависят от точки входа.
+# Порядок перемешиваем: один и тот же SNI у всех установок этого скрипта —
+# лишний признак для массового сканирования.
+REALITY_POOL=(
+  www.microsoft.com www.bing.com   www.samsung.com www.nvidia.com
+  www.amd.com       www.intel.com  www.tesla.com   www.sap.com
+  www.oracle.com    www.dell.com   www.lenovo.com  www.cisco.com
+  www.qualcomm.com  www.hp.com
+)
+# Кандидат годен, только если с ЭТОГО сервера проходит TLS 1.3 + X25519 +
+# валидный для домена сертификат И реально согласован h2. Код возврата
+# s_client h2 не подтверждает (0 и без ALPN), а с -brief строка ALPN не
+# печатается — поэтому grep по полному выводу.
+reality_target_ok() {
+  local d="$1" out
+  out="$(timeout 10 openssl s_client -connect "${d}:443" -servername "$d" \
+    -tls1_3 -groups X25519 -alpn h2 \
+    -verify_return_error -verify_hostname "$d" </dev/null 2>&1)" || return 1
+  grep -q '^ALPN protocol: h2$' <<<"$out"
+}
+log "выбираю Reality target (TLS 1.3 + X25519 + h2 + валидный сертификат)"
+REALITY_SNI=""
+mapfile -t _pool < <(printf '%s\n' "${REALITY_POOL[@]}" | shuf)
+for d in "${_pool[@]}"; do
+  if reality_target_ok "$d"; then REALITY_SNI="$d"; break; fi
+  log "  $d — не подходит, следующий"
+done
+[[ -n "$REALITY_SNI" ]] || die "ни один домен из пула не прошёл TLS-проверку с этого сервера.
+Проверь на сервере: DNS (getent hosts www.microsoft.com), время (timedatectl),
+исходящий 443 (не режет ли провайдер/хостинг)."
+REALITY_TARGET="${REALITY_SNI}:443"
+log "Reality target: ${REALITY_TARGET}"
 
 log "своп 2GB (подушка безопасности на VPS с малым RAM)"
 if swapon --show | grep -q .; then
@@ -262,153 +282,6 @@ ENCRYPTION=$(echo "$VLESSENC_X25519" | grep -oE 'mlkem768x25519plus\.native\.0rt
   exit 1
 }
 
-log "локальная заглушка dest (nginx на 127.0.0.1:${DEST_PORT})"
-mkdir -p /etc/nginx/fakesite-ssl
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-  -keyout /etc/nginx/fakesite-ssl/key.pem -out /etc/nginx/fakesite-ssl/cert.pem \
-  -days 3650 -nodes -subj "/CN=${SNI}" -addext "subjectAltName=DNS:${SNI}" >/dev/null 2>&1
-
-# Заглушка отдаёт настоящую HTML-страницу, а не голый "OK" — если кто-то
-# зайдёт на dest без валидной REALITY-авторизации (обычный curl/браузер),
-# видит правдоподобный, нейтральный "статус-страница" сайт вместо явного
-# признака "это заглушка VPN". Жанр выбран сознательно — тысячи реальных
-# компаний держат почти такой же шаблон (Statuspage/Instatus-стиль), не
-# привязан ни к какому конкретному бренду, поэтому подходит под любой SNI
-# из пула.
-mkdir -p /etc/nginx/fakesite-html
-cat > /etc/nginx/fakesite-html/index.html <<'HTMLEOF'
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Meridian Status</title>
-<style>
-  :root {
-    --bg: #f7f8fa;
-    --surface: #ffffff;
-    --border: #e3e6ea;
-    --text: #1a2233;
-    --text-dim: #6b7683;
-    --good: #1a9e5c;
-    --good-bg: #e7f7ee;
-  }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0;
-    background: var(--bg);
-    color: var(--text);
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-    -webkit-font-smoothing: antialiased;
-  }
-  .wrap { max-width: 720px; margin: 0 auto; padding: 48px 24px 64px; }
-  .brand { display: flex; align-items: center; gap: 10px; margin-bottom: 40px; }
-  .brand-mark {
-    width: 28px; height: 28px; border-radius: 7px;
-    background: linear-gradient(135deg, #2b3a55, #1a2233);
-    flex-shrink: 0;
-  }
-  .brand-name { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
-  .status-banner {
-    display: flex; align-items: center; gap: 12px;
-    background: var(--good-bg); border: 1px solid #c7ecd8;
-    border-radius: 10px; padding: 16px 18px; margin-bottom: 36px;
-  }
-  .status-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--good); flex-shrink: 0; }
-  .status-banner strong { font-size: 15px; font-weight: 600; color: #0f6b3d; }
-  .status-banner span { display: block; font-size: 12.5px; color: #3d7a5a; margin-top: 1px; }
-
-  .section-title {
-    font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em;
-    color: var(--text-dim); margin: 0 0 12px;
-  }
-  .services {
-    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden;
-    margin-bottom: 36px;
-  }
-  .svc-row {
-    display: flex; align-items: center; justify-content: space-between;
-    padding: 14px 18px; border-bottom: 1px solid var(--border);
-  }
-  .svc-row:last-child { border-bottom: none; }
-  .svc-name { font-size: 14px; font-weight: 500; }
-  .svc-right { display: flex; align-items: center; gap: 8px; }
-  .svc-right .status-dot { width: 7px; height: 7px; }
-  .svc-right span { font-size: 12.5px; color: var(--good); font-weight: 500; }
-
-  .uptime-title { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
-  .uptime-title span:last-child { font-size: 12px; color: var(--text-dim); }
-  .bars { display: flex; gap: 2px; height: 32px; margin-bottom: 8px; }
-  .bar { flex: 1; background: var(--good); border-radius: 2px; opacity: 0.85; }
-  .bars-caption { display: flex; justify-content: space-between; font-size: 11px; color: var(--text-dim); }
-
-  footer {
-    margin-top: 44px; padding-top: 18px; border-top: 1px solid var(--border);
-    font-size: 12px; color: var(--text-dim); display: flex; justify-content: space-between;
-  }
-</style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="brand">
-      <div class="brand-mark"></div>
-      <div class="brand-name">Meridian &middot; Status</div>
-    </div>
-
-    <div class="status-banner">
-      <div class="status-dot"></div>
-      <div>
-        <strong>All systems operational</strong>
-        <span>No incidents reported in the last 90 days</span>
-      </div>
-    </div>
-
-    <div class="section-title">Services</div>
-    <div class="services">
-      <div class="svc-row"><span class="svc-name">API</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
-      <div class="svc-row"><span class="svc-name">Dashboard</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
-      <div class="svc-row"><span class="svc-name">Authentication</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
-      <div class="svc-row"><span class="svc-name">Edge network</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
-      <div class="svc-row"><span class="svc-name">Webhooks</span><div class="svc-right"><div class="status-dot"></div><span>Operational</span></div></div>
-    </div>
-
-    <div class="uptime-title"><span class="section-title" style="margin:0">90-day uptime</span><span>99.98%</span></div>
-    <div class="bars" id="bars"></div>
-    <div class="bars-caption"><span>90 days ago</span><span>Today</span></div>
-
-    <footer>
-      <span>&copy; Meridian Systems</span>
-      <span id="ts">Updated just now</span>
-    </footer>
-  </div>
-  <script>
-    var b = document.getElementById('bars');
-    for (var i = 0; i < 90; i++) {
-      var d = document.createElement('div');
-      d.className = 'bar';
-      if (Math.random() < 0.02) d.style.opacity = 0.35;
-      b.appendChild(d);
-    }
-    document.getElementById('ts').textContent = 'Updated ' + new Date().toUTCString();
-  </script>
-</body>
-</html>
-HTMLEOF
-
-cat > /etc/nginx/conf.d/fakesite.conf <<EOF
-server {
-    listen 127.0.0.1:${DEST_PORT} ssl;
-    server_name ${SNI};
-    ssl_certificate /etc/nginx/fakesite-ssl/cert.pem;
-    ssl_certificate_key /etc/nginx/fakesite-ssl/key.pem;
-    root /etc/nginx/fakesite-html;
-    index index.html;
-}
-EOF
-nginx -t >/dev/null
-systemctl enable --now nginx >/dev/null 2>&1
-systemctl reload nginx
-
 log "config.json"
 mkdir -p /usr/local/etc/xray
 cat > /usr/local/etc/xray/config.json <<EOF
@@ -428,9 +301,9 @@ cat > /usr/local/etc/xray/config.json <<EOF
       "security": "reality",
       "realitySettings": {
         "show": false,
-        "dest": "127.0.0.1:${DEST_PORT}",
+        "target": "${REALITY_TARGET}",
         "xver": 0,
-        "serverNames": ["${SNI}"],
+        "serverNames": ["${REALITY_SNI}"],
         "privateKey": "${PRIVATE_KEY}",
         "shortIds": ["${SHORT_ID}"]
       }
@@ -441,32 +314,21 @@ cat > /usr/local/etc/xray/config.json <<EOF
 }
 EOF
 
-systemctl enable --now xray >/dev/null 2>&1
+# Битый конфиг ловим до рестарта: иначе xray падает уже в systemd, и причина
+# видна только в journalctl.
+if ! XRAY_TEST_OUT="$(/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json 2>&1)"; then
+  printf '%s\n' "$XRAY_TEST_OUT" >&2
+  die "xray run -test не принял config.json — xray не перезапускаю"
+fi
+systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 sleep 1
 systemctl is-active --quiet xray || { echo "xray не запустился" >&2; journalctl -u xray --no-pager -n 40 >&2; exit 1; }
 ss -ltnp | grep -q ':443 ' || { echo "порт 443 не слушается" >&2; exit 1; }
-# retry: сразу после `enable --now` + `reload` nginx иногда ловит короткое
-# окно, когда TLS-листенер ещё не до конца поднялся (SSL_do_handshake failed
-# / unexpected ccs message в error.log). Обычно проходит за 1-2с, но на
-# свежепереустановленном VPS ловилось окно >6с — старого бюджета 5×1с не
-# хватало, и установка падала уже после успешной настройки xray. Даём ~1 мин
-# и дважды пинаем nginx полным рестартом (не reload).
-FAKESITE_OK=0
-systemctl restart nginx 2>/dev/null || true
-sleep 3
-for try in $(seq 1 30); do
-  if curl -sk "https://127.0.0.1:${DEST_PORT}/" 2>/dev/null | grep -q "Meridian"; then
-    FAKESITE_OK=1
-    break
-  fi
-  [ "$try" = 10 ] && { systemctl restart nginx 2>/dev/null || true; }
-  sleep 2
-done
-[[ "$FAKESITE_OK" == 1 ]] || { echo "fakesite не отвечает после 30 попыток" >&2; exit 1; }
 
 echo "===XRAY_AUTO_INSTALL_VARS==="
 echo "UUID=${UUID}"
+echo "REALITY_SNI=${REALITY_SNI}"
 echo "SHORT_ID=${SHORT_ID}"
 echo "PRIVATE_KEY=${PRIVATE_KEY}"
 echo "PUBLIC_KEY=${PUBLIC_KEY}"
@@ -474,8 +336,6 @@ echo "DECRYPTION=${DECRYPTION}"
 echo "ENCRYPTION=${ENCRYPTION}"
 echo "===END==="
 REMOTE_EOF
-
-sed -i "s/__SNI__/${SNI}/; s/__DEST_PORT__/${DEST_PORT}/" "$WORKDIR/bootstrap.sh"
 
 log "Заливаю и запускаю bootstrap на сервере (это займёт минуту-две)..."
 scp_pw "$WORKDIR/bootstrap.sh" "root@${SERVER_IP}:/root/bootstrap.sh"
@@ -485,10 +345,10 @@ BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>
 }
 
 eval "$(echo "$BOOTSTRAP_OUT" | sed -n '/===XRAY_AUTO_INSTALL_VARS===/,/===END===/p' | grep -E '^[A-Z_]+=' )"
-for v in UUID SHORT_ID PRIVATE_KEY PUBLIC_KEY DECRYPTION ENCRYPTION; do
+for v in UUID REALITY_SNI SHORT_ID PRIVATE_KEY PUBLIC_KEY DECRYPTION ENCRYPTION; do
   [ -n "${!v:-}" ] || die "Не получил значение $v от сервера."
 done
-echo "  OK — сервис xray активен, порт 443 слушается, fakesite отвечает."
+echo "  OK — сервис xray активен, порт 443 слушается, Reality target: ${REALITY_SNI}:443"
 
 # ---------------------------------------------------------------------------
 # 2. SSH key: generate, install, verify via a brand-new connection
@@ -793,7 +653,7 @@ fi
 # 5. Output
 # ---------------------------------------------------------------------------
 
-VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#${SERVER_IP}"
+VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#${SERVER_IP}"
 
 cat > "$SUMMARY_FILE" <<EOF
 xray-auto-install — VLESS + XHTTP + Reality + Vision + VLESS Encryption
@@ -808,6 +668,9 @@ ssh -i '${KEY_PATH}' root@${SERVER_IP}
 nftables, policy drop, открыты только:
   ${SSH_PORT}/tcp — SSH
   443/tcp — VLESS
+
+== Reality ==
+SNI / target: ${REALITY_SNI} / ${REALITY_SNI}:443
 
 == Ссылка ==
 ${VLESS_LINK}

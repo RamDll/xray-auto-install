@@ -173,7 +173,9 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
   `nf_conntrack_max = 32768` не применяется (sysctl отрабатывает раньше, чем
   загружается модуль) и лимит молча остаётся дефолтным.
 - **`geoip:private` → blackhole** в маршрутизации Xray — клиенты не ходят
-  через сервер в его локальную сеть и loopback.
+  через сервер в его локальную сеть и loopback. С `domainStrategy:
+  IPIfNonMatch`: иначе правило по IP обходится любым доменом, который
+  резолвится в приватный адрес (`localhost`, `*.nip.io`).
 - **`SystemMaxUse=100M` для journald** (drop-in
   `/etc/systemd/journald.conf.d/00-xray-auto-install.conf`) — без лимита журнал systemd растёт
   неограниченно; на том же 130.17.21.198 access-лог xray (по одной строке на

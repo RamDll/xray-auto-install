@@ -422,6 +422,10 @@ mkdir -p /usr/local/etc/xray
 # outbounds: freedom первым — он остаётся выходом по умолчанию; blackhole +
 # правило geoip:private — чтобы клиенты не ходили через сервер в его локальную
 # сеть/loopback (сеть провайдера, 127.0.0.1-сервисы, метаданные облака).
+# domainStrategy IPIfNonMatch обязателен: в дефолтном AsIs ip-правило видит
+# только запросы прямо по IP, и его обходит любой домен, резолвящийся в
+# приватный адрес (localhost, *.nip.io), а также подмена IP на домен через
+# sniffing destOverride. С IPIfNonMatch домен резолвится для маршрутизации.
 # Во временный файл (mktemp создаёт его 600) и затем install: `cat >` в уже
 # существующий config.json сохранил бы его старые права.
 CFG_TMP="$(mktemp)"
@@ -456,6 +460,7 @@ cat > "$CFG_TMP" <<EOF
     {"protocol": "blackhole", "tag": "block"}
   ],
   "routing": {
+    "domainStrategy": "IPIfNonMatch",
     "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}]
   }
 }

@@ -38,10 +38,25 @@ command -v ssh-keygen >/dev/null 2>&1 || die "ssh-keygen is required on this mac
 
 read -rp "Server IP: " SERVER_IP
 [ -n "$SERVER_IP" ] || die "IP не может быть пустым."
+# Ровно 4 октета 0–255 без ведущих нулей: inet_aton читает «010» как
+# восьмеричное 8, и ssh ушёл бы не на тот адрес. IP идёт в имена файлов,
+# ссылку и summary, поэтому hostname и IPv6 не принимаем вовсе.
+IPV4_OCTET='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+if [[ ! "$SERVER_IP" =~ ^${IPV4_OCTET}(\.${IPV4_OCTET}){3}$ ]]; then
+  case "$SERVER_IP" in
+    *:*)       die "IPv6 не поддерживается — нужен IPv4-адрес сервера." ;;
+    *[A-Za-z]*) die "Нужен IPv4-адрес, а не имя хоста (сервер создаётся под конкретный IP)." ;;
+    *)         die "Некорректный IPv4-адрес: '${SERVER_IP}' (нужно 4 числа 0–255 через точку, без ведущих нулей)." ;;
+  esac
+fi
 
 read -rsp "Root password (от провайдера): " ROOT_PASSWORD
 echo
 [ -n "$ROOT_PASSWORD" ] || die "Пароль не может быть пустым."
+# sshpass -e берёт пароль из окружения; с -p он виден в аргументах процесса
+# (ps, /proc/*/cmdline) всё время работы ssh.
+export SSHPASS="$ROOT_PASSWORD"
+unset ROOT_PASSWORD
 
 # Тестовые флаги: намеренно ломают доступ после рискованного шага, чтобы одной
 # командой проверить цепочку «сломали → таймер → доступ вернулся → reboot →
@@ -85,8 +100,8 @@ SSH_COMMON_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCo
 SSH_PW_OPTS=("${SSH_COMMON_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
 SSH_KEY_OPTS=("${SSH_COMMON_OPTS[@]}" -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes -i "$KEY_PATH")
 
-ssh_pw()  { sshpass -p "$ROOT_PASSWORD" ssh "${SSH_PW_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
-scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp "${SSH_PW_OPTS[@]}" -P "$SSH_PORT" "$@"; }
+ssh_pw()  { sshpass -e ssh "${SSH_PW_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
+scp_pw()  { sshpass -e scp "${SSH_PW_OPTS[@]}" -P "$SSH_PORT" "$@"; }
 ssh_key() { ssh "${SSH_KEY_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
 scp_key() { scp "${SSH_KEY_OPTS[@]}" -P "$SSH_PORT" "$@"; }
 
@@ -300,13 +315,18 @@ rm -f /root/xray-install.sh
                                # падает на второй write) => exit 141 под set -o pipefail,
                                # воспроизведено вживую на 95.128.157.141
 
+XRAY_VER="$(/usr/local/bin/xray version 2>/dev/null | sed -n '1s/^Xray \([^ ]*\).*/\1/p')"
+
 log "генерирую ключи"
 UUID=$(/usr/local/bin/xray uuid)
 SHORT_ID=$(openssl rand -hex 8)
 
-X25519_OUT=$(/usr/local/bin/xray x25519)
-PRIVATE_KEY=$(echo "$X25519_OUT" | grep -iE '^Private ?key' | sed -E 's/^[^:]+:\s*//')
-PUBLIC_KEY=$(echo "$X25519_OUT" | grep -iE '^Public ?key|^Password' | head -1 | sed -E 's/^[^:]+:\s*//')
+# Сырой вывод `xray x25519` / `xray vlessenc` содержит приватные ключи —
+# захватываем вместе со stderr и НИКОГДА не печатаем, даже при ошибке.
+X25519_OUT="$(/usr/local/bin/xray x25519 2>&1)" \
+  || die "xray x25519 завершился с ошибкой (Xray ${XRAY_VER:-?}); вывод не печатаю — в нём ключи"
+PRIVATE_KEY=$(grep -iE '^Private ?key' <<<"$X25519_OUT" | sed -E 's/^[^:]+:\s*//')
+PUBLIC_KEY=$(grep -iE '^Public ?key|^Password' <<<"$X25519_OUT" | sed -n '1s/^[^:]*:[[:space:]]*//p')
 
 # `xray vlessenc` печатает ДВА раздела: "X25519, not Post-Quantum" (короткие
 # значения, ~44 символа) и "ML-KEM-768, Post-Quantum" (длинные, ~1600+ символов
@@ -320,22 +340,40 @@ PUBLIC_KEY=$(echo "$X25519_OUT" | grep -iE '^Public ?key|^Password' | head -1 | 
 # "постквантовое шифрование" — на деле это не так, см. историю в чате).
 # Оба варианта используют одинаковый строковый префикс mlkem768x25519plus.native,
 # поэтому явно обрезаем вывод ДО заголовка ML-KEM-768, чтобы не выхватить его.
-VLESSENC_OUT=$(/usr/local/bin/xray vlessenc)
-VLESSENC_X25519=$(echo "$VLESSENC_OUT" | awk '/ML-KEM-768/{exit} {print}')
-DECRYPTION=$(echo "$VLESSENC_X25519" | grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' | head -1)
-ENCRYPTION=$(echo "$VLESSENC_X25519" | grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' | head -1)
+VLESSENC_OUT="$(/usr/local/bin/xray vlessenc 2>&1)" \
+  || die "xray vlessenc завершился с ошибкой (Xray ${XRAY_VER:-?}); вывод не печатаю — в нём ключи"
+VLESSENC_X25519=$(awk '/ML-KEM-768/{exit} {print}' <<<"$VLESSENC_OUT")
+DECRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.[0-9]+s\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p)
+ENCRYPTION=$(grep -oE 'mlkem768x25519plus\.native\.0rtt\.[A-Za-z0-9_-]+' <<<"$VLESSENC_X25519" | sed -n 1p)
+unset X25519_OUT VLESSENC_OUT VLESSENC_X25519
 
 [ -n "$UUID" ] && [ -n "$SHORT_ID" ] && [ -n "$PRIVATE_KEY" ] && [ -n "$PUBLIC_KEY" ] \
-  && [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] || {
-  echo "Не удалось распарсить сгенерированные ключи." >&2
-  echo "--- xray x25519 ---" >&2; echo "$X25519_OUT" >&2
-  echo "--- xray vlessenc ---" >&2; echo "$VLESSENC_OUT" >&2
-  exit 1
+  && [ -n "$DECRYPTION" ] && [ -n "$ENCRYPTION" ] \
+  || die "не удалось распарсить ключи из xray x25519/vlessenc (Xray ${XRAY_VER:-?} — сменился формат вывода?)"
+
+# Маскирует серверные тайны (приватный ключ Reality и decryption VLESS
+# Encryption) в диагностике, которую печатаем при ошибке. Заглушка @@ на
+# случай пустой переменной: иначе sed получил бы "s|||g" и упал бы прямо
+# в аварийном пути. Точки экранируем — decryption содержит их.
+redact() {
+  local pk="${PRIVATE_KEY:-@@}" dc="${DECRYPTION:-@@}"
+  sed -e "s|${pk//./\\.}|<redacted>|g" -e "s|${dc//./\\.}|<redacted>|g"
 }
 
-log "config.json"
+# Группа, под которой xray читает конфиг, — из юнита (Xray-install ставит
+# User=nobody без Group=). Два отдельных вызова: у `-p User,Group --value`
+# вывод — две строки без имён, на их порядок не опираемся.
+XRAY_USER="$(systemctl show -p User --value xray)"
+XRAY_GROUP="$(systemctl show -p Group --value xray)"
+[[ -n "$XRAY_GROUP" ]] || XRAY_GROUP="$(id -gn "${XRAY_USER:-root}")" \
+  || die "не удалось определить группу пользователя xray (${XRAY_USER:-?})"
+
+log "config.json (640 root:${XRAY_GROUP})"
 mkdir -p /usr/local/etc/xray
-cat > /usr/local/etc/xray/config.json <<EOF
+# Во временный файл (mktemp создаёт его 600) и затем install: `cat >` в уже
+# существующий config.json сохранил бы его старые права.
+CFG_TMP="$(mktemp)"
+cat > "$CFG_TMP" <<EOF
 {
   "log": {"loglevel": "warning", "access": "none"},
   "inbounds": [{
@@ -364,41 +402,50 @@ cat > /usr/local/etc/xray/config.json <<EOF
   "outbounds": [{"protocol": "freedom"}]
 }
 EOF
+install -m 640 -o root -g "$XRAY_GROUP" "$CFG_TMP" /usr/local/etc/xray/config.json
+rm -f "$CFG_TMP"
 
 # Битый конфиг ловим до рестарта: иначе xray падает уже в systemd, и причина
 # видна только в journalctl.
 if ! XRAY_TEST_OUT="$(/usr/local/bin/xray run -test -c /usr/local/etc/xray/config.json 2>&1)"; then
-  printf '%s\n' "$XRAY_TEST_OUT" >&2
+  printf '%s\n' "$XRAY_TEST_OUT" | redact >&2
   die "xray run -test не принял config.json — xray не перезапускаю"
 fi
 systemctl enable xray >/dev/null 2>&1
 systemctl restart xray
 sleep 1
-systemctl is-active --quiet xray || { echo "xray не запустился" >&2; journalctl -u xray --no-pager -n 40 >&2; exit 1; }
-ss -ltnp | grep -q ':443 ' || { echo "порт 443 не слушается" >&2; exit 1; }
+if ! systemctl is-active --quiet xray; then
+  journalctl -u xray --no-pager -n 40 2>&1 | redact >&2
+  die "xray не запустился (журнал выше, тайны замаскированы)"
+fi
+ss -ltnp | grep -q ':443 ' || die "порт 443 не слушается"
 
-echo "===XRAY_AUTO_INSTALL_VARS==="
-echo "UUID=${UUID}"
-echo "REALITY_SNI=${REALITY_SNI}"
-echo "SHORT_ID=${SHORT_ID}"
-echo "PRIVATE_KEY=${PRIVATE_KEY}"
-echo "PUBLIC_KEY=${PUBLIC_KEY}"
-echo "DECRYPTION=${DECRYPTION}"
-echo "ENCRYPTION=${ENCRYPTION}"
-echo "===END==="
+# Домой уходит только то, что нужно для ссылки. PRIVATE_KEY и DECRYPTION —
+# серверные тайны, они остаются только в config.json.
+printf '%s\n' "===XRAY_AUTO_INSTALL_VARS===" \
+  "UUID=${UUID}" "REALITY_SNI=${REALITY_SNI}" "SHORT_ID=${SHORT_ID}" \
+  "PUBLIC_KEY=${PUBLIC_KEY}" "ENCRYPTION=${ENCRYPTION}" "===END==="
 REMOTE_EOF
 
 log "Заливаю и запускаю bootstrap на сервере (это займёт минуту-две)..."
 scp_pw "$WORKDIR/bootstrap.sh" "root@${SERVER_IP}:/root/bootstrap.sh"
 BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>&1)" || {
-  echo "$BOOTSTRAP_OUT" >&2
+  # Блок VARS (если bootstrap успел его напечатать) вырезаем до печати.
+  sed '/^===XRAY_AUTO_INSTALL_VARS===$/,/^===END===$/d' <<<"$BOOTSTRAP_OUT" >&2
   die "Bootstrap упал (полный вывод выше).
 Если в выводе нет ошибки, а оборвалось соединение — просто запусти скрипт
 повторно: пароль на этом этапе ещё не отключён."
 }
 
-eval "$(echo "$BOOTSTRAP_OUT" | sed -n '/===XRAY_AUTO_INSTALL_VARS===/,/===END===/p' | grep -E '^[A-Z_]+=' )"
-for v in UUID REALITY_SNI SHORT_ID PRIVATE_KEY PUBLIC_KEY DECRYPTION ENCRYPTION; do
+# Без eval: вывод сервера — данные, а не код. Берём только ключи из белого
+# списка; всё прочее в блоке молча игнорируется.
+UUID="" REALITY_SNI="" SHORT_ID="" PUBLIC_KEY="" ENCRYPTION=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    UUID|REALITY_SNI|SHORT_ID|PUBLIC_KEY|ENCRYPTION) printf -v "$key" '%s' "$value" ;;
+  esac
+done < <(sed -n '/^===XRAY_AUTO_INSTALL_VARS===$/,/^===END===$/p' <<<"$BOOTSTRAP_OUT")
+for v in UUID REALITY_SNI SHORT_ID PUBLIC_KEY ENCRYPTION; do
   [ -n "${!v:-}" ] || die "Не получил значение $v от сервера."
 done
 echo "  OK — сервис xray активен, порт 443 слушается, Reality target: ${REALITY_SNI}:443"
@@ -417,6 +464,8 @@ ssh_pw "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${PUBKEY_CONTENT}' 
 log "Проверяю ключевой доступ НОВЫМ соединением (пароль ещё не трогали)..."
 ssh_key "echo ok" >/dev/null || die "Ключевой доступ не заработал — пароль НЕ отключаю, разбирайся руками."
 echo "  OK"
+# Дальше только ключ — пароль больше не держим в окружении дочерних ssh/scp.
+unset SSHPASS
 
 # ---------------------------------------------------------------------------
 # 3. SSH hardening. Один загружаемый скрипт, три стадии:
@@ -764,6 +813,9 @@ fi
 
 VLESS_LINK="vless://${UUID}@${SERVER_IP}:443?encryption=${ENCRYPTION}&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=${FP}&pbk=${PUBLIC_KEY}&sid=${SHORT_ID}&spx=%2F&type=xhttp#${SERVER_IP}"
 
+# Сначала пустой файл с 600, потом запись: `cat >` в существующий файл
+# сохранил бы его старые права (раньше summary со ссылкой выходил 664).
+install -m 600 /dev/null "$SUMMARY_FILE"
 cat > "$SUMMARY_FILE" <<EOF
 xray-auto-install — VLESS + XHTTP + Reality + Vision + VLESS Encryption
 Сервер: ${SERVER_IP}

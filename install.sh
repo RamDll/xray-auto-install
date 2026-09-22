@@ -14,9 +14,9 @@
 #
 # What it deliberately does NOT do (evaluated and rejected as low-value for this
 # threat model — see project README): create a separate sudo user, install
-# fail2ban, or set an SSH key passphrase. (A 2GB swap file IS created — see
-# project README; this used to be on the same "skip" list but was reconsidered
-# after a live 130.17.21.198 low-RAM incident on 2026-09-22.)
+# fail2ban, or set an SSH key passphrase. (A swap file sized by RAM IS created —
+# see project README; this used to be on the same "skip" list but was
+# reconsidered after a live 130.17.21.198 low-RAM incident on 2026-09-22.)
 #
 # Robustness patterns below (dpkg-lock handling, ssh.socket detection, nft
 # syntax-check + timed auto-rollback) are ported from
@@ -287,17 +287,40 @@ fi
 REALITY_TARGET="${REALITY_SNI}:443"
 log "Reality target: ${REALITY_TARGET}"
 
-log "своп 2GB (подушка безопасности на VPS с малым RAM)"
+# Своп по объёму RAM: < 2 GiB → 2 GiB, 2–4 GiB → 1 GiB, > 4 GiB → не нужен.
+# Это подушка от OOM-killer'а на маленьких VPS (130.17.21.198: 967MB без
+# свопа), а не рабочая память. MemTotal у «2GB»-тарифа чуть меньше 2 GiB
+# (ядро резервирует часть) — такой VPS честно попадает в первую ступень.
+# В LXC/OpenVZ swapon запрещён — это предупреждение, не ошибка: без свопа
+# сервис работает, просто без подушки.
+MEM_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+if   (( MEM_KB < 2 * 1024 * 1024 )); then SWAP_MB=2048
+elif (( MEM_KB <= 4 * 1024 * 1024 )); then SWAP_MB=1024
+else SWAP_MB=0
+fi
 if swapon --show | grep -q .; then
   log "своп уже есть — пропускаю"
+elif (( SWAP_MB == 0 )); then
+  log "RAM $((MEM_KB / 1024))MB > 4 GiB — своп не создаю"
 else
-  fallocate -l 2G /swapfile
+  log "своп ${SWAP_MB}MB (RAM $((MEM_KB / 1024))MB)"
+  # fallocate не везде даёт файл, годный для свопа (не поддерживается ФС) —
+  # тогда честная запись нулями через dd.
+  rm -f /swapfile
+  if ! fallocate -l "${SWAP_MB}M" /swapfile 2>/dev/null; then
+    log "fallocate не сработал — создаю своп через dd"
+    rm -f /swapfile
+    dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_MB" status=none
+  fi
   chmod 600 /swapfile
-  mkswap /swapfile >/dev/null
-  swapon /swapfile
-  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
-  sysctl -qp /etc/sysctl.d/99-swappiness.conf
+  if mkswap /swapfile >/dev/null 2>&1 && swapon /swapfile 2>/dev/null; then
+    grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+    sysctl -qp /etc/sysctl.d/99-swappiness.conf
+  else
+    log "ПРЕДУПРЕЖДЕНИЕ: swapon не разрешён (LXC/OpenVZ?) — продолжаю без свопа"
+    rm -f /swapfile
+  fi
 fi
 
 log "включаю BBR + fq qdisc"
@@ -396,6 +419,9 @@ XRAY_GROUP="$(systemctl show -p Group --value xray)"
 
 log "config.json (640 root:${XRAY_GROUP})"
 mkdir -p /usr/local/etc/xray
+# outbounds: freedom первым — он остаётся выходом по умолчанию; blackhole +
+# правило geoip:private — чтобы клиенты не ходили через сервер в его локальную
+# сеть/loopback (сеть провайдера, 127.0.0.1-сервисы, метаданные облака).
 # Во временный файл (mktemp создаёт его 600) и затем install: `cat >` в уже
 # существующий config.json сохранил бы его старые права.
 CFG_TMP="$(mktemp)"
@@ -425,7 +451,13 @@ cat > "$CFG_TMP" <<EOF
     },
     "sniffing": {"enabled": true, "destOverride": ["http", "tls", "quic"]}
   }],
-  "outbounds": [{"protocol": "freedom"}]
+  "outbounds": [
+    {"protocol": "freedom", "tag": "direct"},
+    {"protocol": "blackhole", "tag": "block"}
+  ],
+  "routing": {
+    "rules": [{"type": "field", "ip": ["geoip:private"], "outboundTag": "block"}]
+  }
 }
 EOF
 install -m 640 -o root -g "$XRAY_GROUP" "$CFG_TMP" /usr/local/etc/xray/config.json
@@ -797,7 +829,12 @@ EOF
   if [[ -e /proc/sys/net/netfilter/nf_conntrack_max ]]; then
     echo "net.netfilter.nf_conntrack_max = 32768" > /etc/sysctl.d/99-conntrack.conf
     sysctl -qp /etc/sysctl.d/99-conntrack.conf
-    log "nf_conntrack_max поднят до 32768"
+    # После reboot systemd-sysctl отрабатывает раньше, чем nftables подтянет
+    # nf_conntrack, — ключа ещё нет, и лимит молча остаётся дефолтным (на
+    # 138.124.71.35 после перезагрузки было 8192). modules-load.d грузит модуль
+    # до systemd-sysctl (тот упорядочен After=systemd-modules-load).
+    echo nf_conntrack > /etc/modules-load.d/nf_conntrack.conf
+    log "nf_conntrack_max поднят до 32768 (модуль грузится при старте)"
   else
     log "nf_conntrack_max недоступен (модуль не загружен?) — пропускаю"
   fi

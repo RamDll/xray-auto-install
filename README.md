@@ -161,13 +161,19 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
 
 ## Что делается сверх голого VLESS
 
-- **Своп 2GB** (`/swapfile`, `vm.swappiness=10`) — раньше был в списке "сознательно
+- **Своп по объёму RAM** (`/swapfile`, `vm.swappiness=10`): меньше 2 GiB → 2 GiB,
+  2–4 GiB → 1 GiB, больше 4 GiB → не создаётся; в LXC/OpenVZ, где `swapon`
+  запрещён, установка идёт дальше без свопа. Раньше был в списке "сознательно
   не делаем" (не относится к безопасности, не хотелось усложнять установку), но
   после реального инцидента на 130.17.21.198 (2026-09-22: 967MB RAM без свопа,
   почти под завязку забиты буферами/кэшем — при всплеске нагрузки это прямой
-  путь к OOM-killer'у вместо деградации) решение пересмотрено: своп теперь
-  ставится всегда, это дешёвая подушка безопасности на типично маленьких VPS
-  под такой сервис.
+  путь к OOM-killer'у вместо деградации) решение пересмотрено: на маленьких
+  VPS своп — дешёвая подушка безопасности под такой сервис.
+- **`nf_conntrack` в `/etc/modules-load.d/`** — иначе после перезагрузки
+  `nf_conntrack_max = 32768` не применяется (sysctl отрабатывает раньше, чем
+  загружается модуль) и лимит молча остаётся дефолтным.
+- **`geoip:private` → blackhole** в маршрутизации Xray — клиенты не ходят
+  через сервер в его локальную сеть и loopback.
 - **`SystemMaxUse=100M` для journald** (drop-in
   `/etc/systemd/journald.conf.d/00-xray-auto-install.conf`) — без лимита журнал systemd растёт
   неограниченно; на том же 130.17.21.198 access-лог xray (по одной строке на
@@ -185,6 +191,7 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
 - `/etc/nftables.conf` — правила фаервола
 - `/etc/ssh/sshd_config.d/00-xray-auto-install.conf` — настройки SSH
 - `/etc/sysctl.d/99-bbr.conf`, `/etc/modules-load.d/bbr.conf` — BBR
+- `/etc/sysctl.d/99-conntrack.conf`, `/etc/modules-load.d/nf_conntrack.conf` — лимит conntrack
 - `/etc/systemd/journald.conf.d/00-xray-auto-install.conf` — лимит журнала
 
 Страховочные `systemd-run`-таймеры (`xray-auto-install-ssh-rollback`,

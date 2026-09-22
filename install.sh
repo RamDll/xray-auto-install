@@ -54,22 +54,29 @@ SUMMARY_FILE="$HOME/xray-auto-install-${IP_SLUG}-summary.txt"
 WORKDIR="$(mktemp -d)"
 trap 'rm -rf "$WORKDIR"' EXIT
 
-SSH_PW_OPTS=(-o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ConnectTimeout=15)
-SSH_KEY_OPTS=(-o StrictHostKeyChecking=accept-new -o PasswordAuthentication=no -o IdentitiesOnly=yes -o ConnectTimeout=15 -i "$KEY_PATH")
+# Скрипт рассчитан на свежий/переустановленный сервер — новый образ = новый
+# хост-ключ, это норма, а не MITM. Поэтому у каждого сервера свой known_hosts,
+# который пересоздаётся при каждом запуске: основной ~/.ssh/known_hosts не
+# трогаем вообще, а после установки этот файл закрепляет ключ сервера для
+# StrictHostKeyChecking=yes (см. команду в summary).
+KNOWN_HOSTS="$HOME/.ssh/xray-auto-install-${IP_SLUG}.known_hosts"
+install -d -m 700 "$HOME/.ssh"
+rm -f "$KNOWN_HOSTS"
+install -m 600 /dev/null "$KNOWN_HOSTS"
+
+# ServerAlive* — чтобы оборванное соединение (долгий apt на слабом VPS, NAT
+# провайдера) падало через ~1 мин, а не висело бесконечно.
+SSH_COMMON_OPTS=(-o ConnectTimeout=15 -o ServerAliveInterval=15 -o ServerAliveCountMax=4
+  -o "UserKnownHostsFile=$KNOWN_HOSTS" -o StrictHostKeyChecking=accept-new)
+# BatchMode=yes — только в ключевых обёртках: он запрещает любой интерактивный
+# запрос, включая пароль, и sshpass с ним перестаёт работать.
+SSH_PW_OPTS=("${SSH_COMMON_OPTS[@]}" -o PreferredAuthentications=password -o PubkeyAuthentication=no)
+SSH_KEY_OPTS=("${SSH_COMMON_OPTS[@]}" -o BatchMode=yes -o PasswordAuthentication=no -o IdentitiesOnly=yes -i "$KEY_PATH")
 
 ssh_pw()  { sshpass -p "$ROOT_PASSWORD" ssh "${SSH_PW_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
-scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp -o StrictHostKeyChecking=accept-new -o PreferredAuthentications=password -o PubkeyAuthentication=no -P "$SSH_PORT" "$@"; }
+scp_pw()  { sshpass -p "$ROOT_PASSWORD" scp "${SSH_PW_OPTS[@]}" -P "$SSH_PORT" "$@"; }
 ssh_key() { ssh "${SSH_KEY_OPTS[@]}" -p "$SSH_PORT" "root@${SERVER_IP}" "$@"; }
-scp_key() { scp -o StrictHostKeyChecking=accept-new -o IdentitiesOnly=yes -i "$KEY_PATH" -P "$SSH_PORT" "$@"; }
-
-# Скрипт рассчитан на свежий/переустановленный сервер по этому же IP — смена
-# хост-ключа тут норма (новый образ = новый ключ), а не признак MITM. Тихо
-# чистим старую запись под этот конкретный IP перед подключением, чтобы не
-# упасть на "Host key verification failed"; если записи нет — no-op.
-if ssh-keygen -F "$SERVER_IP" >/dev/null 2>&1; then
-  ssh-keygen -R "$SERVER_IP" >/dev/null 2>&1
-  echo "  (старый хост-ключ для ${SERVER_IP} в known_hosts очищен — сервер переустановлен)"
-fi
+scp_key() { scp "${SSH_KEY_OPTS[@]}" -P "$SSH_PORT" "$@"; }
 
 log "Проверяю парольный доступ к ${SERVER_IP}..."
 ssh_pw "echo ok" >/dev/null || die "Не удалось подключиться по паролю. Проверь IP и пароль — либо на этом сервере
@@ -128,6 +135,9 @@ log "останавливаю apt-daily/unattended-upgrades, чтобы не в�
 stop_apt_daily
 wait_dpkg_lock
 dpkg --configure -a >/dev/null 2>&1 || true
+# dpkg --configure дожимает распакованные пакеты, но не чинит сломанные
+# зависимости после прерванного apt — это делает только -f install.
+apt-get "${APT_OPTS[@]}" -f install -y >/dev/null 2>&1 || true
 
 log "apt update"
 apt_do update -qq
@@ -138,8 +148,11 @@ apt_do -y install -qq curl unzip openssl nftables ca-certificates >/dev/null
 systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
 log "ограничиваю journald (SystemMaxUse=100M), иначе на слабом VPS лог xray может забить диск"
-sed -i 's/^#\?SystemMaxUse=.*/SystemMaxUse=100M/' /etc/systemd/journald.conf
-grep -q '^SystemMaxUse=' /etc/systemd/journald.conf || echo 'SystemMaxUse=100M' >> /etc/systemd/journald.conf
+# Drop-in, а не правка journald.conf: пакетный файл остаётся нетронутым
+# (обновления systemd не спрашивают про конфликт), а наш лимит — отдельный
+# файл, который видно в `systemd-analyze cat-config systemd/journald.conf`.
+mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=100M\n' > /etc/systemd/journald.conf.d/00-xray-auto-install.conf
 systemctl restart systemd-journald
 
 # Reality/TLS чувствителен к рассинхронизации часов — сертификаты и хендшейк
@@ -234,14 +247,25 @@ fi
 
 log "Xray-core (официальный установщик, latest stable release)"
 XRAY_INSTALL_OK=0
+# Сначала в файл, потом запуск — два отдельных кода возврата. Старый вариант
+# `bash -c "$(curl …)"` при падении curl выполнял `bash -c ""` с кодом 0, и
+# неудачная загрузка выглядела как успешная установка.
 for try in 1 2 3; do
-  if bash -c "$(curl -fsSL --retry 3 https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" @ install >/dev/null 2>&1; then
-    XRAY_INSTALL_OK=1
-    break
+  if curl --fail --location --silent --show-error --retry 3 \
+       -o /root/xray-install.sh \
+       https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh; then
+    if bash /root/xray-install.sh install >/dev/null 2>&1; then
+      XRAY_INSTALL_OK=1
+      break
+    fi
+    log "установщик Xray-core завершился с ошибкой (попытка $try)"
+  else
+    log "не удалось скачать установщик Xray-core (попытка $try)"
   fi
-  log "установка Xray-core — попытка $try не удалась, жду 10с и повторяю"
+  log "жду 10с и повторяю"
   sleep 10
 done
+rm -f /root/xray-install.sh
 [[ "$XRAY_INSTALL_OK" == 1 ]] || die "не удалось установить Xray-core после 3 попыток"
 [ -x /usr/local/bin/xray ] || die "установщик отработал, но /usr/local/bin/xray не найден"
 /usr/local/bin/xray version   # печатает 2 строки; НЕ пайпить в head — xray version | head -1
@@ -341,7 +365,9 @@ log "Заливаю и запускаю bootstrap на сервере (это з
 scp_pw "$WORKDIR/bootstrap.sh" "root@${SERVER_IP}:/root/bootstrap.sh"
 BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>&1)" || {
   echo "$BOOTSTRAP_OUT" >&2
-  die "Bootstrap упал (полный вывод выше)."
+  die "Bootstrap упал (полный вывод выше).
+Если в выводе нет ошибки, а оборвалось соединение — просто запусти скрипт
+повторно: пароль на этом этапе ещё не отключён."
 }
 
 eval "$(echo "$BOOTSTRAP_OUT" | sed -n '/===XRAY_AUTO_INSTALL_VARS===/,/===END===/p' | grep -E '^[A-Z_]+=' )"
@@ -661,7 +687,7 @@ xray-auto-install — VLESS + XHTTP + Reality + Vision + VLESS Encryption
 Дата: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 == Доступ ==
-ssh -i '${KEY_PATH}' root@${SERVER_IP}
+ssh -i '${KEY_PATH}' -o UserKnownHostsFile='${KNOWN_HOSTS}' -o StrictHostKeyChecking=yes root@${SERVER_IP}
   (парольный вход отключён, только по ключу)
 
 == Firewall ==

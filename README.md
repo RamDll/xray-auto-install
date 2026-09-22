@@ -150,7 +150,8 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
   путь к OOM-killer'у вместо деградации) решение пересмотрено: своп теперь
   ставится всегда, это дешёвая подушка безопасности на типично маленьких VPS
   под такой сервис.
-- **`SystemMaxUse=100M` в journald.conf** — без лимита журнал systemd растёт
+- **`SystemMaxUse=100M` для journald** (drop-in
+  `/etc/systemd/journald.conf.d/00-xray-auto-install.conf`) — без лимита журнал systemd растёт
   неограниченно; на том же 130.17.21.198 access-лог xray (по одной строке на
   каждое новое соединение) за ~13 дней набрал 87MB и держал `systemd-journald`
   на 158MB RSS на сервере с 967MB total.
@@ -166,6 +167,7 @@ sing-box. `fp=firefox` выбран по умолчанию: на тесте `fp
 - `/etc/nftables.conf` — правила фаервола
 - `/etc/ssh/sshd_config.d/00-hardening.conf`, `00-disable-password.conf`
 - `/etc/sysctl.d/99-bbr.conf`, `/etc/modules-load.d/bbr.conf` — BBR
+- `/etc/systemd/journald.conf.d/00-xray-auto-install.conf` — лимит журнала
 
 Страховочные `systemd-run`-таймеры (`xray-auto-install-ssh-rollback`,
 `xray-auto-install-fw-rollback`) существуют только пока не подтверждены —

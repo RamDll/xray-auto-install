@@ -66,6 +66,16 @@ XAI_TEST_BREAK_FW="${XAI_TEST_BREAK_FW:-0}"
 XAI_TEST_BREAK_SSH="${XAI_TEST_BREAK_SSH:-0}"
 [[ "$XAI_TEST_BREAK_FW" =~ ^[01]$ && "$XAI_TEST_BREAK_SSH" =~ ^[01]$ ]] \
   || die "XAI_TEST_BREAK_FW / XAI_TEST_BREAK_SSH принимают только 0 или 1."
+# Ручной выбор Reality SNI (иначе — случайно из пула на сервере). Нужен, когда
+# провайдер клиента режет конкретный домен: серверная TLS-проверка этого не
+# видит. Строгий формат hostname — значение уходит в команду на сервере,
+# в конфиг и в ссылку.
+XAI_REALITY_SNI="${XAI_REALITY_SNI:-}"
+if [[ -n "$XAI_REALITY_SNI" ]]; then
+  [[ "$XAI_REALITY_SNI" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] \
+    || die "XAI_REALITY_SNI='${XAI_REALITY_SNI}' — не похоже на имя домена (строчные буквы, цифры, дефис, точки; например www.hp.com)."
+  echo "  Reality SNI задан вручную: ${XAI_REALITY_SNI} (будет проверен с сервера)"
+fi
 if [[ "$XAI_TEST_BREAK_FW$XAI_TEST_BREAK_SSH" != 00 ]]; then
   warn "ТЕСТОВЫЙ РЕЖИМ: XAI_TEST_BREAK_FW=${XAI_TEST_BREAK_FW} XAI_TEST_BREAK_SSH=${XAI_TEST_BREAK_SSH} — установка специально сломает доступ и упадёт; доступ вернёт страховочный таймер."
 fi
@@ -231,11 +241,15 @@ ntp_ok || log "предупреждение: время ещё не синхро
 # сильно зависят от точки входа.
 # Порядок перемешиваем: один и тот же SNI у всех установок этого скрипта —
 # лишний признак для массового сканирования.
+# Без www.lenovo.com: проходил все проверки с сервера, но у клиента трафик
+# резал провайдер (2026-09-22, 138.124.71.35; с www.hp.com на том же сервере
+# и тех же ключах — работало). Серверная проверка такого не видит — для
+# этого есть ручной выбор XAI_REALITY_SNI.
 REALITY_POOL=(
   www.microsoft.com www.bing.com   www.samsung.com www.nvidia.com
   www.amd.com       www.intel.com  www.tesla.com   www.sap.com
-  www.oracle.com    www.dell.com   www.lenovo.com  www.cisco.com
-  www.qualcomm.com  www.hp.com
+  www.oracle.com    www.dell.com   www.cisco.com   www.qualcomm.com
+  www.hp.com
 )
 # Кандидат годен, только если с ЭТОГО сервера проходит TLS 1.3 + X25519 +
 # валидный для домена сертификат И реально согласован h2. Код возврата
@@ -250,14 +264,26 @@ reality_target_ok() {
 }
 log "выбираю Reality target (TLS 1.3 + X25519 + h2 + валидный сертификат)"
 REALITY_SNI=""
-mapfile -t _pool < <(printf '%s\n' "${REALITY_POOL[@]}" | shuf)
-for d in "${_pool[@]}"; do
-  if reality_target_ok "$d"; then REALITY_SNI="$d"; break; fi
-  log "  $d — не подходит, следующий"
-done
-[[ -n "$REALITY_SNI" ]] || die "ни один домен из пула не прошёл TLS-проверку с этого сервера.
+XAI_REALITY_SNI="${XAI_REALITY_SNI:-}"
+if [[ -n "$XAI_REALITY_SNI" ]]; then
+  # Домен задан вручную — проверяем только его. Не прошёл → стоп, а не тихая
+  # подмена на случайный: человек выбрал его не просто так (проверен у его
+  # провайдера), и неожиданный SNI в ссылке хуже явной ошибки.
+  reality_target_ok "$XAI_REALITY_SNI" \
+    || die "заданный XAI_REALITY_SNI=${XAI_REALITY_SNI} не прошёл TLS-проверку с этого сервера
+(нужны TLS 1.3 + X25519 + h2 + валидный сертификат). Выбери другой домен или запусти без переменной."
+  REALITY_SNI="$XAI_REALITY_SNI"
+  log "  задан вручную: ${REALITY_SNI} — проверку прошёл"
+else
+  mapfile -t _pool < <(printf '%s\n' "${REALITY_POOL[@]}" | shuf)
+  for d in "${_pool[@]}"; do
+    if reality_target_ok "$d"; then REALITY_SNI="$d"; break; fi
+    log "  $d — не подходит, следующий"
+  done
+  [[ -n "$REALITY_SNI" ]] || die "ни один домен из пула не прошёл TLS-проверку с этого сервера.
 Проверь на сервере: DNS (getent hosts www.microsoft.com), время (timedatectl),
 исходящий 443 (не режет ли провайдер/хостинг)."
+fi
 REALITY_TARGET="${REALITY_SNI}:443"
 log "Reality target: ${REALITY_TARGET}"
 
@@ -429,7 +455,7 @@ REMOTE_EOF
 
 log "Заливаю и запускаю bootstrap на сервере (это займёт минуту-две)..."
 scp_pw "$WORKDIR/bootstrap.sh" "root@${SERVER_IP}:/root/bootstrap.sh"
-BOOTSTRAP_OUT="$(ssh_pw "bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>&1)" || {
+BOOTSTRAP_OUT="$(ssh_pw "XAI_REALITY_SNI='${XAI_REALITY_SNI}' bash /root/bootstrap.sh && rm -f /root/bootstrap.sh" 2>&1)" || {
   # Блок VARS (если bootstrap успел его напечатать) вырезаем до печати.
   sed '/^===XRAY_AUTO_INSTALL_VARS===$/,/^===END===$/d' <<<"$BOOTSTRAP_OUT" >&2
   die "Bootstrap упал (полный вывод выше).

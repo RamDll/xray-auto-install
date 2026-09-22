@@ -47,7 +47,7 @@ bash <(wget -qO- https://raw.githubusercontent.com/RamDll/xray-auto-install/main
    перемешивает пул крупных доменов (`www.microsoft.com`, `www.bing.com`,
    `www.samsung.com`, `www.nvidia.com`, `www.amd.com`, `www.intel.com`,
    `www.tesla.com`, `www.sap.com`, `www.oracle.com`, `www.dell.com`,
-   `www.lenovo.com`, `www.cisco.com`, `www.qualcomm.com`, `www.hp.com`) и
+   `www.cisco.com`, `www.qualcomm.com`, `www.hp.com`) и
    берёт первый, к которому с этого VPS проходит TLS 1.3 + X25519 с валидным
    сертификатом и согласованным h2. `target` — этот же реальный сайт
    (`<домен>:443`): неавторизованный клиент видит его настоящий сертификат,
@@ -55,6 +55,12 @@ bash <(wget -qO- https://raw.githubusercontent.com/RamDll/xray-auto-install/main
    apple, icloud, etc. as the target may get your IP blocked by the GFW`) и
    без CDN-фронтов cloudflare/jsdelivr. Если не прошёл ни один домен —
    установка останавливается с подсказкой (DNS / время / исходящий 443).
+   `www.lenovo.com` из пула убран: с сервера он проходил все проверки, но
+   трафик клиента по нему резал провайдер. Серверная проверка такого не
+   видит, поэтому домен можно задать вручную — например, уже проверенный у
+   своего провайдера: `XAI_REALITY_SNI=www.hp.com ./install.sh`. Заданный
+   домен проверяется с сервера так же; не прошёл — установка останавливается,
+   а не подставляет случайный.
 6. Пишет `/usr/local/etc/xray/config.json`: VLESS + XHTTP (транспорт) + Reality
    (маскировка) + `xtls-rprx-vision` (flow) + VLESS Encryption. Именно
    какая-то форма VLESS Encryption тут обязательна — `encryption: none` с

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #
 # xray-auto-install — native (no Docker, no panel) VLESS + XHTTP + Reality + Vision
-# + VLESS Encryption (mlkem768x25519plus, ephemeral X25519 variant — not full
-# ML-KEM-768; see the comment above VLESSENC_X25519 below for why), on a fresh
-# Debian/Ubuntu box.
+# + VLESS Encryption (mlkem768x25519plus: hybrid ML-KEM-768 + X25519 key
+# exchange; the short variant with X25519 server authentication — see the
+# comment above VLESSENC_X25519 below), on a fresh Debian 12+ / Ubuntu 22.04+ box.
 #
 # Usage:
 #   ./install.sh
@@ -377,16 +377,20 @@ X25519_OUT="$(/usr/local/bin/xray x25519 2>&1)" \
 PRIVATE_KEY=$(grep -iE '^Private ?key' <<<"$X25519_OUT" | sed -E 's/^[^:]+:\s*//')
 PUBLIC_KEY=$(grep -iE '^Public ?key|^Password' <<<"$X25519_OUT" | sed -n '1s/^[^:]*:[[:space:]]*//p')
 
-# `xray vlessenc` печатает ДВА раздела: "X25519, not Post-Quantum" (короткие
-# значения, ~44 символа) и "ML-KEM-768, Post-Quantum" (длинные, ~1600+ символов
-# — полноценный ML-KEM-768). Берём КОРОТКИЙ, эфемерный X25519-вариант: сам
-# `xray vlessenc` в шапке вывода прямо пишет "Ephemeral key exchange is
-# Post-Quantum safe anyway" — эфемерность ключа уже даёт защиту от
-# harvest-now-decrypt-later, полный ML-KEM-768 тут даёт лишь дополнительную
-# алгоритмическую стойкость ценой гигантской ссылки/QR. Это же — короткий
-# вариант — было в изначальной вручную протестированной и подтверждённой
-# рабочей конфигурации 138.124.71.35 (в её summary он был ошибочно подписан
-# "постквантовое шифрование" — на деле это не так, см. историю в чате).
+# `xray vlessenc` печатает ДВА варианта. В ОБОИХ обмен ключами один и тот же —
+# гибридный ML-KEM-768 + X25519, эфемерный (отсюда "Ephemeral key exchange is
+# Post-Quantum safe anyway" в его выводе): записанный сегодня трафик не
+# расшифровать и будущим квантовым компьютером (harvest-now-decrypt-later).
+# Различается только АУТЕНТИФИКАЦИЯ СЕРВЕРА:
+#   "X25519, not Post-Quantum"  — короткие значения (~44 символа);
+#   "ML-KEM-768, Post-Quantum"  — длинные (~1600+ символов).
+# Берём короткий: аутентификация на X25519 не защищена от будущего АКТИВНОГО
+# квантового MITM (подделать сервер в реальном времени), но это угроза
+# другого порядка, чем пассивная запись, а длинный вариант превращает
+# ссылку/QR в кирпич текста. Подпись "постквантовое шифрование" у ранней
+# конфигурации 138.124.71.35 была верной в части конфиденциальности.
+# Внешний TLS Reality — классический; постквантовость даёт именно этот
+# внутренний слой VLESS Encryption.
 # Оба варианта используют одинаковый строковый префикс mlkem768x25519plus.native,
 # поэтому явно обрезаем вывод ДО заголовка ML-KEM-768, чтобы не выхватить его.
 VLESSENC_OUT="$(/usr/local/bin/xray vlessenc 2>&1)" \
@@ -487,7 +491,7 @@ ss -ltnp | grep -q ':443 ' || die "порт 443 не слушается"
 # серверные тайны, они остаются только в config.json.
 printf '%s\n' "===XRAY_AUTO_INSTALL_VARS===" \
   "UUID=${UUID}" "REALITY_SNI=${REALITY_SNI}" "SHORT_ID=${SHORT_ID}" \
-  "PUBLIC_KEY=${PUBLIC_KEY}" "ENCRYPTION=${ENCRYPTION}" "===END==="
+  "PUBLIC_KEY=${PUBLIC_KEY}" "ENCRYPTION=${ENCRYPTION}" "XRAY_VERSION=${XRAY_VER:-}" "===END==="
 REMOTE_EOF
 
 log "Заливаю и запускаю bootstrap на сервере (это займёт минуту-две)..."
@@ -502,16 +506,19 @@ BOOTSTRAP_OUT="$(ssh_pw "XAI_REALITY_SNI='${XAI_REALITY_SNI}' bash /root/bootstr
 
 # Без eval: вывод сервера — данные, а не код. Берём только ключи из белого
 # списка; всё прочее в блоке молча игнорируется.
-UUID="" REALITY_SNI="" SHORT_ID="" PUBLIC_KEY="" ENCRYPTION=""
+UUID="" REALITY_SNI="" SHORT_ID="" PUBLIC_KEY="" ENCRYPTION="" XRAY_VERSION=""
 while IFS='=' read -r key value; do
   case "$key" in
-    UUID|REALITY_SNI|SHORT_ID|PUBLIC_KEY|ENCRYPTION) printf -v "$key" '%s' "$value" ;;
+    UUID|REALITY_SNI|SHORT_ID|PUBLIC_KEY|ENCRYPTION|XRAY_VERSION) printf -v "$key" '%s' "$value" ;;
   esac
 done < <(sed -n '/^===XRAY_AUTO_INSTALL_VARS===$/,/^===END===$/p' <<<"$BOOTSTRAP_OUT")
 for v in UUID REALITY_SNI SHORT_ID PUBLIC_KEY ENCRYPTION; do
   [ -n "${!v:-}" ] || die "Не получил значение $v от сервера."
 done
-echo "  OK — сервис xray активен, порт 443 слушается, Reality target: ${REALITY_SNI}:443"
+# XRAY_VERSION — справочная (в summary и финальный вывод): её отсутствие не
+# ошибка, поэтому в цикл обязательных значений выше она не входит.
+XRAY_VERSION="${XRAY_VERSION:-неизвестна}"
+echo "  OK — Xray ${XRAY_VERSION} активен, порт 443 слушается, Reality target: ${REALITY_SNI}:443"
 
 # ---------------------------------------------------------------------------
 # 2. SSH key: generate, install, verify via a brand-new connection
@@ -898,7 +905,8 @@ nftables, policy drop, открыты только:
   ${SSH_PORT}/tcp — SSH
   443/tcp — VLESS
 
-== Reality ==
+== Xray / Reality ==
+Xray-core: ${XRAY_VERSION} (без фиксации версии — последний стабильный на момент установки)
 SNI / target: ${REALITY_SNI} / ${REALITY_SNI}:443
 
 == Ссылка ==
@@ -914,5 +922,7 @@ log "Готово!"
 echo
 echo "$VLESS_LINK"
 echo
+echo "Xray-core: ${XRAY_VERSION}"
 echo "Сводка сохранена: $SUMMARY_FILE"
+echo "Проверка сервера: ./verify.sh ${SERVER_IP}   (с перезагрузкой: ./verify.sh --reboot ${SERVER_IP})"
 echo "SSH-ключ: $KEY_PATH"

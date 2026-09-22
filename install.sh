@@ -14,7 +14,9 @@
 #
 # What it deliberately does NOT do (evaluated and rejected as low-value for this
 # threat model — see project README): create a separate sudo user, install
-# fail2ban, add swap, or set an SSH key passphrase.
+# fail2ban, or set an SSH key passphrase. (A 2GB swap file IS created — see
+# project README; this used to be on the same "skip" list but was reconsidered
+# after a live 130.17.21.198 low-RAM incident on 2026-09-22.)
 #
 # Robustness patterns below (dpkg-lock handling, competing sshd directives,
 # ssh.socket detection, nft syntax-check + timed auto-rollback) are ported from
@@ -155,6 +157,11 @@ log "устанавливаю пакеты"
 apt_do -y install -qq curl unzip nginx openssl nftables ca-certificates >/dev/null
 systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
+log "ограничиваю journald (SystemMaxUse=100M), иначе на слабом VPS лог xray/nginx может забить диск"
+sed -i 's/^#\?SystemMaxUse=.*/SystemMaxUse=100M/' /etc/systemd/journald.conf
+grep -q '^SystemMaxUse=' /etc/systemd/journald.conf || echo 'SystemMaxUse=100M' >> /etc/systemd/journald.conf
+systemctl restart systemd-journald
+
 # Reality/TLS чувствителен к рассинхронизации часов — сертификаты и хендшейк
 # зависят от текущего времени. Если NTP уже синхронизирован или есть живой
 # демон — не трогаем, иначе включаем/ставим systemd-timesyncd.
@@ -178,6 +185,19 @@ else
 fi
 for _ in $(seq 1 10); do ntp_ok && break; sleep 1; done
 ntp_ok || log "предупреждение: время ещё не синхронизировано, продолжаю всё равно"
+
+log "своп 2GB (подушка безопасности на VPS с малым RAM)"
+if swapon --show | grep -q .; then
+  log "своп уже есть — пропускаю"
+else
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile >/dev/null
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  echo 'vm.swappiness=10' > /etc/sysctl.d/99-swappiness.conf
+  sysctl -qp /etc/sysctl.d/99-swappiness.conf
+fi
 
 log "включаю BBR + fq qdisc"
 modprobe tcp_bbr 2>/dev/null || true
@@ -393,7 +413,7 @@ log "config.json"
 mkdir -p /usr/local/etc/xray
 cat > /usr/local/etc/xray/config.json <<EOF
 {
-  "log": {"loglevel": "warning"},
+  "log": {"loglevel": "warning", "access": "none"},
   "inbounds": [{
     "listen": "0.0.0.0",
     "port": 443,

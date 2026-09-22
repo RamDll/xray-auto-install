@@ -18,8 +18,8 @@
 # project README; this used to be on the same "skip" list but was reconsidered
 # after a live 130.17.21.198 low-RAM incident on 2026-09-22.)
 #
-# Robustness patterns below (dpkg-lock handling, competing sshd directives,
-# ssh.socket detection, nft syntax-check + timed auto-rollback) are ported from
+# Robustness patterns below (dpkg-lock handling, ssh.socket detection, nft
+# syntax-check + timed auto-rollback) are ported from
 # github.com/RamDll/ovpn-stack's install/bootstrap.sh, where they were added
 # after real failures on fresh VPS images.
 
@@ -42,6 +42,18 @@ read -rp "Server IP: " SERVER_IP
 read -rsp "Root password (от провайдера): " ROOT_PASSWORD
 echo
 [ -n "$ROOT_PASSWORD" ] || die "Пароль не может быть пустым."
+
+# Тестовые флаги: намеренно ломают доступ после рискованного шага, чтобы одной
+# командой проверить цепочку «сломали → таймер → доступ вернулся → reboot →
+# доступ есть». FW — убрать SSH-порт из ruleset, SSH — сломать вход по ключу
+# после lockdown.
+XAI_TEST_BREAK_FW="${XAI_TEST_BREAK_FW:-0}"
+XAI_TEST_BREAK_SSH="${XAI_TEST_BREAK_SSH:-0}"
+[[ "$XAI_TEST_BREAK_FW" =~ ^[01]$ && "$XAI_TEST_BREAK_SSH" =~ ^[01]$ ]] \
+  || die "XAI_TEST_BREAK_FW / XAI_TEST_BREAK_SSH принимают только 0 или 1."
+if [[ "$XAI_TEST_BREAK_FW$XAI_TEST_BREAK_SSH" != 00 ]]; then
+  warn "ТЕСТОВЫЙ РЕЖИМ: XAI_TEST_BREAK_FW=${XAI_TEST_BREAK_FW} XAI_TEST_BREAK_SSH=${XAI_TEST_BREAK_SSH} — установка специально сломает доступ и упадёт; доступ вернёт страховочный таймер."
+fi
 
 SSH_PORT=22
 # Reality SNI/target выбирается на сервере (bootstrap, после NTP), а не здесь:
@@ -96,6 +108,21 @@ set -Eeuo pipefail
 
 log()  { printf '[bootstrap] %s\n' "$*"; }
 die()  { printf '[bootstrap] ОШИБКА: %s\n' "$*" >&2; exit 1; }
+
+# Поддерживаются Debian 12+ и Ubuntu 22.04+. Проверка SSH по `sshd -T`
+# строгая, а OpenSSH < 8.7 (Debian 11, Ubuntu 20.04) печатает там другие
+# имена директив — отказываемся сразу, до установки чего-либо, а не падаем
+# на середине с полунастроенным сервером.
+# shellcheck disable=SC1091
+. /etc/os-release
+case "${ID:-}" in
+  debian) OS_MIN=12 ;;
+  ubuntu) OS_MIN=22.04 ;;
+  *) die "поддерживаются только Debian 12+ и Ubuntu 22.04+, а тут: ${PRETTY_NAME:-${ID:-неизвестно}}" ;;
+esac
+if [[ -z "${VERSION_ID:-}" || "$(printf '%s\n' "$OS_MIN" "$VERSION_ID" | sort -V | sed -n 1p)" != "$OS_MIN" ]]; then
+  die "поддерживаются только Debian 12+ и Ubuntu 22.04+, а тут: ${PRETTY_NAME:-$ID ${VERSION_ID:-}}"
+fi
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a   # иначе needrestart на Debian может повиснуть на интерактивном списке служб
@@ -392,42 +419,30 @@ ssh_key "echo ok" >/dev/null || die "Ключевой доступ не зара
 echo "  OK"
 
 # ---------------------------------------------------------------------------
-# 3. SSH hardening. One uploaded script, called twice with different stages:
-#    "prep" (harmless bits, password still enabled as a safety net) then
-#    "lockdown" (disable password). Each stage does, itself, on the server:
-#      - neutralize competing PasswordAuthentication/PermitRootLogin "yes"
-#        lines in OTHER config files (cloud-init's 50-cloud-init.conf is a
-#        known offender — sshd takes the FIRST matching directive, so a
-#        stray "yes" elsewhere can silently override our 00- drop-in)
-#      - `sshd -t` before restarting, abort+rollback the drop-in on failure
-#      - detect ssh.socket (Debian trixie can socket-activate ssh) and
-#        restart the right unit(s)
-#      - a local TCP self-check on 127.0.0.1:$port right after restart —
-#        fails fast with a clear message instead of a home-side timeout
-#      - `sshd -T` (authoritative effective config) to confirm what actually
-#        took effect, not just what we wrote
-#    "lockdown" additionally arms a systemd-run timer that reverts the
-#    password-disable drop-in after 3 minutes unless cancelled — cancelled
-#    only after this script confirms a brand-new key-based connection works.
+# 3. SSH hardening. Один загружаемый скрипт, три стадии:
+#    "prep"     — наш drop-in только с безвредным hardening (пароль ещё
+#                 включён как страховка);
+#    "lockdown" — тот же drop-in + запрет пароля, под страховочным таймером;
+#    "confirm"  — снять таймер; вызывается ТОЛЬКО после того, как домашняя
+#                 машина зашла по ключу новым соединением.
+#    Вся настройка — один файл 00-xray-auto-install.conf. Чужие конфиги
+#    (sshd_config, 50-cloud-init.conf) не трогаем, поэтому откат — это просто
+#    удалить наш файл и сделать reload. Результат проверяем по `sshd -T -C`
+#    (эффективный конфиг с учётом Match для реального адреса клиента), а не
+#    по тому, что записали.
 # ---------------------------------------------------------------------------
 
 cat > "$WORKDIR/ssh-harden.sh" <<'REMOTE_EOF'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-STAGE="${1:?usage: ssh-harden.sh prep|lockdown}"
+STAGE="${1:?usage: ssh-harden.sh prep|lockdown|confirm}"
 PORT=22
+DROPIN=/etc/ssh/sshd_config.d/00-xray-auto-install.conf
+TIMER=xray-auto-install-ssh-rollback
+XAI_TEST_BREAK_SSH="${XAI_TEST_BREAK_SSH:-0}"
 
 log()  { printf '[ssh-harden] %s\n' "$*"; }
 die()  { printf '[ssh-harden] ОШИБКА: %s\n' "$*" >&2; exit 1; }
-
-backup_capped() {
-  local file="$1"
-  [[ -f "$file" ]] || return 0
-  cp -a "$file" "${file}.bak.$(date +%s)"
-  local old
-  mapfile -t old < <(ls -1t "${file}".bak.* 2>/dev/null | tail -n +4)
-  if [[ ${#old[@]} -gt 0 ]]; then rm -f -- "${old[@]}"; fi
-}
 
 socket_active() {
   systemctl list-unit-files ssh.socket >/dev/null 2>&1 && \
@@ -465,84 +480,129 @@ local_selfcheck() {
   [[ "$up" -eq 1 ]]
 }
 
-DROPIN_HARDENING=/etc/ssh/sshd_config.d/00-hardening.conf
-DROPIN_NOPASS=/etc/ssh/sshd_config.d/00-disable-password.conf
+rollback_ssh() {
+  rm -f "$DROPIN"
+  restart_ssh || true
+}
+
+stop_timer() {
+  systemctl stop "${TIMER}.timer" >/dev/null 2>&1 || true
+  systemctl reset-failed "${TIMER}.service" "${TIMER}.timer" >/dev/null 2>&1 || true
+}
+
+# sshd берёт ПЕРВОЕ вхождение директивы. Наш 00-файл идёт первым внутри
+# sshd_config.d, но строки самого sshd_config, стоящие ВЫШЕ Include, читаются
+# раньше него и молча побеждают. Требуем: активный Include sshd_config.d/*.conf
+# есть и стоит выше первой незакомментированной директивы из нашего набора.
+# Иначе отказываемся — чужой файл не правим. mawk (дефолтный awk на Debian)
+# не знает IGNORECASE, поэтому tolower.
+check_include_order() {
+  local rc=0
+  awk '
+    { l = tolower($0); sub(/^[ \t]+/, "", l) }
+    l == "" || l ~ /^#/ { next }
+    !inc && l ~ /^include[ \t]+\/etc\/ssh\/sshd_config\.d\/\*\.conf[ \t]*$/ { inc = NR; next }
+    !first && l ~ /^(passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|permitrootlogin|x11forwarding|maxauthtries|logingracetime)([ \t]|=)/ { first = NR }
+    END { if (!inc) exit 10; if (first && first < inc) exit 11; exit 0 }
+  ' /etc/ssh/sshd_config || rc=$?
+  case "$rc" in
+    0)  return 0 ;;
+    10) die "в /etc/ssh/sshd_config нет активного 'Include /etc/ssh/sshd_config.d/*.conf' — наш drop-in не будет прочитан. Нестандартный образ: настрой SSH руками." ;;
+    11) die "в /etc/ssh/sshd_config одна из директив (PasswordAuthentication/PermitRootLogin/…) стоит ВЫШЕ Include sshd_config.d и перебьёт наш drop-in. Чужой файл не правлю: перенеси Include в начало или убери директиву руками." ;;
+    *)  die "не удалось разобрать /etc/ssh/sshd_config (awk rc=$rc)" ;;
+  esac
+}
+
+HARDENING='X11Forwarding no
+MaxAuthTries 3
+LoginGraceTime 30'
+LOCKDOWN='PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin prohibit-password'
+
+write_dropin() {
+  local tmp
+  tmp="$(mktemp)"
+  { printf '# xray-auto-install: единственный наш файл в sshd_config.d\n'; printf '%s\n' "$@"; } > "$tmp"
+  install -m 644 "$tmp" "$DROPIN"
+  rm -f "$tmp"
+}
+
+# Эффективный конфиг для реального клиента: -C с адресом из SSH_CLIENT
+# учитывает Match-блоки (Match Address/User), которые голый `sshd -T` не видит.
+# Аргументы — пары ключ=ожидание, ожидание — regex.
+check_effective() {
+  local addr eff pair key want got bad=0
+  addr="${SSH_CLIENT%% *}"
+  [[ -n "$addr" ]] || { log "SSH_CLIENT пуст — не знаю адрес клиента для sshd -T -C"; return 1; }
+  if ! eff="$(sshd -T -C "user=root,host=x,addr=${addr}" 2>&1)"; then
+    log "sshd -T -C упал:"; printf '%s\n' "$eff" >&2
+    return 1
+  fi
+  for pair in "$@"; do
+    key="${pair%%=*}"; want="${pair#*=}"
+    got="$(awk -v k="$key" '$1 == k { print $2; exit }' <<<"$eff")"
+    if [[ ! "$got" =~ ^(${want})$ ]]; then
+      log "sshd -T: ${key}=${got:-<нет>}, ожидалось ${want}"
+      bad=1
+    fi
+  done
+  return "$bad"
+}
+EXPECT_HARDENING=(x11forwarding=no maxauthtries=3 logingracetime=30)
+# without-password — старое имя prohibit-password; sshd -T на Debian 13
+# печатает именно его, хотя в конфиге написано prohibit-password.
+EXPECT_LOCKDOWN=(passwordauthentication=no kbdinteractiveauthentication=no 'permitrootlogin=prohibit-password|without-password')
 
 if [[ "$STAGE" == "prep" ]]; then
-  backup_capped "$DROPIN_HARDENING"
-  cat > "$DROPIN_HARDENING" <<'EOF'
-X11Forwarding no
-MaxAuthTries 3
-LoginGraceTime 30
-EOF
+  check_include_order
+  write_dropin "$HARDENING"
 
   log "проверяю синтаксис (sshd -t)"
   if ! sshd -t; then
-    rm -f "$DROPIN_HARDENING"
-    die "sshd -t не прошёл — drop-in удалён, ничего не перезапускал"
+    rm -f "$DROPIN"
+    die "sshd -t не прошёл — drop-in удалён, ничего не перезагружал"
   fi
 
   restart_ssh
-  local_selfcheck || { rm -f "$DROPIN_HARDENING"; restart_ssh; die "ssh не слушает $PORT локально после restart — откатил и перезапустил"; }
-  log "prep готово: X11Forwarding/MaxAuthTries/LoginGraceTime применены, ssh слушает $PORT"
+  local_selfcheck || { rollback_ssh; die "ssh не слушает $PORT локально после reload — откатил наш drop-in"; }
+  check_effective "${EXPECT_HARDENING[@]}" || { rollback_ssh; die "sshd -T не подтвердил hardening — откатил наш drop-in"; }
+  log "prep готово: X11Forwarding/MaxAuthTries/LoginGraceTime подтверждены sshd -T, ssh слушает $PORT"
 
 elif [[ "$STAGE" == "lockdown" ]]; then
-  backup_capped "$DROPIN_NOPASS"
-  cat > "$DROPIN_NOPASS" <<'EOF'
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-PermitRootLogin prohibit-password
-EOF
+  check_include_order
 
-  # sshd берёт ПЕРВОЕ вхождение директивы. Наши 00-* дроп-ины идут первыми
-  # по алфавиту, но если где-то (главный sshd_config, cloud-init) уже стоит
-  # `yes` РАНЬШЕ по include-порядку — она молча победит. Глушим все такие
-  # строки везде, кроме наших файлов.
-  cf_list=(/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf)
-  for cf in "${cf_list[@]}"; do
-    [[ -f "$cf" && "$cf" != "$DROPIN_NOPASS" && "$cf" != "$DROPIN_HARDENING" ]] || continue
-    grep -qiE '^[[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes' "$cf" || continue
-    backup_capped "$cf"
-    sed -ri 's/^([[:space:]]*(PasswordAuthentication|KbdInteractiveAuthentication|ChallengeResponseAuthentication|PermitRootLogin)[[:space:]]+yes.*)/# \1  # off: xray-auto-install/I' "$cf"
-    log "заглушил конкурирующую строку в $cf"
-  done
+  # Страховочный таймер — ДО рискованного шага: если после reload ключ не
+  # пустит, сервер через 3 минуты сам удалит наш drop-in (вернётся пароль).
+  # Без работающего таймера пароль не отключаем вообще.
+  stop_timer
+  systemd-run --unit="$TIMER" --on-active=180 \
+    --description="xray-auto-install: откат отключения пароля, если не подтверждено" \
+    /bin/bash -c "rm -f ${DROPIN}; systemctl reload ssh.service 2>/dev/null || systemctl reload ssh 2>/dev/null || systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true" \
+    >/dev/null 2>&1 || die "systemd-run не смог поставить страховочный таймер — пароль НЕ отключаю"
+  systemctl is-active --quiet "${TIMER}.timer" || die "страховочный таймер ${TIMER}.timer не активен — пароль НЕ отключаю"
+
+  if [[ "$XAI_TEST_BREAK_SSH" == 1 ]]; then
+    log "ТЕСТ XAI_TEST_BREAK_SSH=1: ломаю вход по ключу (AuthorizedKeysFile в никуда) — доступ вернёт таймер"
+    write_dropin "$HARDENING" "$LOCKDOWN" "AuthorizedKeysFile /nonexistent/xray-auto-install-test"
+  else
+    write_dropin "$HARDENING" "$LOCKDOWN"
+  fi
 
   log "проверяю синтаксис (sshd -t)"
   if ! sshd -t; then
-    rm -f "$DROPIN_NOPASS"
-    die "sshd -t не прошёл — drop-in удалён, пароль НЕ отключён"
+    rollback_ssh; stop_timer
+    die "sshd -t не прошёл — наш drop-in удалён, пароль НЕ отключён"
   fi
-
-  # страховочный таймер: если после restart ключ вдруг не пустит — сервер
-  # сам откатит запрет пароля через 3 минуты. Снимается ниже командой
-  # ssh-harden.sh confirm, вызываемой ТОЛЬКО после успешной проверки новым
-  # соединением с домашней машины.
-  systemd-run --unit=xray-auto-install-ssh-rollback --on-active=180 \
-    --description="xray-auto-install: откат отключения пароля, если не подтверждено" \
-    /bin/bash -c "rm -f ${DROPIN_NOPASS}; systemctl daemon-reload; systemctl reload ssh.service 2>/dev/null || systemctl reload ssh 2>/dev/null || systemctl restart ssh.service 2>/dev/null || systemctl restart ssh 2>/dev/null || true" \
-    >/dev/null 2>&1 || log "systemd-run недоступен — страховочный таймер не поставлен (действую без него)"
 
   restart_ssh
-  if ! local_selfcheck; then
-    rm -f "$DROPIN_NOPASS"
-    restart_ssh
-    die "ssh не слушает $PORT локально после restart — откатил отключение пароля"
-  fi
-
-  sshd_eff="$(sshd -T 2>/dev/null || true)"
-  pw_eff="$(awk '$1=="passwordauthentication"{print $2}' <<<"$sshd_eff")"
-  root_eff="$(awk '$1=="permitrootlogin"{print $2}' <<<"$sshd_eff")"
-  if [[ "$pw_eff" != "no" ]]; then
-    log "ВНИМАНИЕ: sshd -T показывает passwordauthentication=$pw_eff — пароль НЕ отключён эффективно."
-    log "Конкурирующие строки (проверь руками):"
-    grep -rniE '^[[:space:]]*PasswordAuthentication[[:space:]]+yes' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/ 2>/dev/null || true
-  else
-    log "lockdown готово: sshd -T подтверждает passwordauthentication=no, permitrootlogin=$root_eff"
-  fi
+  local_selfcheck || { rollback_ssh; stop_timer; die "ssh не слушает $PORT локально после reload — откатил наш drop-in"; }
+  check_effective "${EXPECT_HARDENING[@]}" "${EXPECT_LOCKDOWN[@]}" \
+    || { rollback_ssh; stop_timer; die "sshd -T не подтвердил отключение пароля — откатил наш drop-in"; }
+  log "lockdown готово: sshd -T подтверждает все 6 директив; жду confirm (иначе откат через 3 мин)"
 
 elif [[ "$STAGE" == "confirm" ]]; then
-  systemctl stop xray-auto-install-ssh-rollback.timer >/dev/null 2>&1 || true
-  systemctl reset-failed xray-auto-install-ssh-rollback.service >/dev/null 2>&1 || true
+  stop_timer
   log "страховочный таймер снят — отключение пароля подтверждено"
 else
   die "неизвестный STAGE: $STAGE"
@@ -560,23 +620,26 @@ ssh_key "echo ok" >/dev/null || die "SSH не поднялся после harden
 echo "  OK"
 
 log "Отключаю парольный вход (страховочный таймер на 3 мин, если что-то пойдёт не так)..."
-LOCKDOWN_OUT="$(ssh_key "bash /root/ssh-harden.sh lockdown" 2>&1)" || { echo "$LOCKDOWN_OUT" >&2; die "lockdown упал (полный вывод выше)."; }
+LOCKDOWN_OUT="$(ssh_key "XAI_TEST_BREAK_SSH=${XAI_TEST_BREAK_SSH} bash /root/ssh-harden.sh lockdown" 2>&1)" \
+  || { echo "$LOCKDOWN_OUT" >&2; die "lockdown упал (полный вывод выше)."; }
 
 log "Проверяю ключевой доступ новым соединением (пароль теперь должен быть отключён)..."
 if ssh_key "echo ok" >/dev/null 2>&1; then
   ssh_key "bash /root/ssh-harden.sh confirm; rm -f /root/ssh-harden.sh"
   echo "  OK — парольный вход отключён, ключ работает, страховочный таймер снят."
 else
-  warn "Новое соединение не удалось! Если это был временный сбой — попробуй ssh руками в ближайшие 3 минуты."
-  warn "Если не получится — сервер сам откатит отключение пароля через страховочный таймер (systemd-run, 3 мин)."
-  die "Останавливаюсь, не продолжаю на firewall без подтверждённого SSH."
+  warn "Новое соединение по ключу не удалось!"
+  warn "Через 3 минуты сервер сам удалит наш SSH drop-in (systemd-run) — вернётся вход по паролю."
+  die "Останавливаюсь, не продолжаю на firewall без подтверждённого SSH. После отката можно запустить скрипт повторно."
 fi
 
 # ---------------------------------------------------------------------------
 # 4. Firewall (nftables): only 22/tcp and 443/tcp, policy drop.
-#    `nft -c -f` validates syntax before touching the live ruleset. A
-#    systemd-run timer reverts to allow-all after 2 minutes unless cancelled
-#    — cancelled only after a brand-new SSH connection confirms access.
+#    `nft -c -f` проверяет синтаксис до применения. Страховочный таймер
+#    ставится ДО применения и снимается только после того, как домашняя
+#    машина зашла новым соединением. Откат аварийный: он не восстанавливает
+#    прежний firewall, а снимает фильтрацию целиком — так, чтобы она не
+#    вернулась и после reboot.
 # ---------------------------------------------------------------------------
 
 cat > "$WORKDIR/firewall.sh" <<'REMOTE_EOF'
@@ -584,12 +647,27 @@ cat > "$WORKDIR/firewall.sh" <<'REMOTE_EOF'
 set -Eeuo pipefail
 STAGE="${1:?usage: firewall.sh apply|confirm}"
 SSH_PORT="__SSH_PORT__"
+TIMER=xray-auto-install-fw-rollback
+XAI_TEST_BREAK_FW="${XAI_TEST_BREAK_FW:-0}"
+ROLLBACK_CMD='nft flush ruleset; systemctl disable nftables; : > /etc/nftables.conf'
 
 log()  { printf '[firewall] %s\n' "$*"; }
 die()  { printf '[firewall] ОШИБКА: %s\n' "$*" >&2; exit 1; }
 
+rollback_fw() { bash -c "$ROLLBACK_CMD" >/dev/null 2>&1 || true; }
+stop_timer() {
+  systemctl stop "${TIMER}.timer" >/dev/null 2>&1 || true
+  systemctl reset-failed "${TIMER}.service" "${TIMER}.timer" >/dev/null 2>&1 || true
+}
+
 if [[ "$STAGE" == "apply" ]]; then
   command -v nft >/dev/null 2>&1 || die "nft не найден (nftables не установлен)"
+
+  SSH_RULE="tcp dport ${SSH_PORT} accept"
+  if [[ "$XAI_TEST_BREAK_FW" == 1 ]]; then
+    log "ТЕСТ XAI_TEST_BREAK_FW=1: не открываю SSH-порт в ruleset — доступ вернёт таймер"
+    SSH_RULE="# ${SSH_RULE} (убрано тестовым флагом XAI_TEST_BREAK_FW)"
+  fi
 
   RENDERED="$(mktemp)"
   cat > "$RENDERED" <<EOF
@@ -604,7 +682,7 @@ table inet filter {
         ct state invalid drop
         icmp type { destination-unreachable, echo-request, time-exceeded } accept
         icmpv6 type { destination-unreachable, time-exceeded, echo-request, nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
-        tcp dport ${SSH_PORT} accept
+        ${SSH_RULE}
         tcp dport 443 accept
     }
     chain forward {
@@ -619,16 +697,19 @@ EOF
   log "проверяю синтаксис (nft -c -f)"
   nft -c -f "$RENDERED" || { rm -f "$RENDERED"; die "nft -c -f не прошёл, ничего не применяю"; }
 
+  stop_timer
+  systemd-run --unit="$TIMER" --on-active=120 \
+    --description="xray-auto-install: откат firewall, если не подтверждено" \
+    /bin/bash -c "$ROLLBACK_CMD" >/dev/null 2>&1 \
+    || { rm -f "$RENDERED"; die "systemd-run не смог поставить страховочный таймер — firewall НЕ применяю"; }
+  systemctl is-active --quiet "${TIMER}.timer" \
+    || { rm -f "$RENDERED"; die "страховочный таймер ${TIMER}.timer не активен — firewall НЕ применяю"; }
+
   install -m 0644 "$RENDERED" /etc/nftables.conf
   rm -f "$RENDERED"
 
-  systemd-run --unit=xray-auto-install-fw-rollback --on-active=120 \
-    --description="xray-auto-install: откат firewall, если не подтверждено" \
-    /bin/bash -c "nft flush ruleset" >/dev/null 2>&1 \
-    || log "systemd-run недоступен — страховочный таймер не поставлен (действую без него)"
-
   log "применяю ruleset"
-  nft -f /etc/nftables.conf || { nft flush ruleset; die "nft -f упал — откатил (flush ruleset)"; }
+  nft -f /etc/nftables.conf || { rollback_fw; stop_timer; die "nft -f упал — откатил (фильтрация снята)"; }
   systemctl enable nftables >/dev/null 2>&1 || true
 
   # nf_conntrack гарантированно загружен только теперь (правило `ct state`
@@ -652,8 +733,7 @@ EOF
   log "firewall применён — жду confirm с домашней машины (иначе откат через 2 мин)"
 
 elif [[ "$STAGE" == "confirm" ]]; then
-  systemctl stop xray-auto-install-fw-rollback.timer >/dev/null 2>&1 || true
-  systemctl reset-failed xray-auto-install-fw-rollback.service >/dev/null 2>&1 || true
+  stop_timer
   log "страховочный таймер снят — firewall подтверждён"
 else
   die "неизвестный STAGE: $STAGE"
@@ -664,15 +744,18 @@ sed -i "s/__SSH_PORT__/${SSH_PORT}/" "$WORKDIR/firewall.sh"
 
 log "Настраиваю nftables (открыты только ${SSH_PORT} и 443)..."
 scp_key "$WORKDIR/firewall.sh" "root@${SERVER_IP}:/root/firewall.sh"
-FIREWALL_OUT="$(ssh_key "bash /root/firewall.sh apply" 2>&1)" || { echo "$FIREWALL_OUT" >&2; die "firewall apply упал (полный вывод выше)."; }
+FIREWALL_OUT="$(ssh_key "XAI_TEST_BREAK_FW=${XAI_TEST_BREAK_FW} bash /root/firewall.sh apply" 2>&1)" \
+  || { echo "$FIREWALL_OUT" >&2; die "firewall apply упал (полный вывод выше)."; }
 
 log "Проверяю доступ новым соединением после применения firewall..."
 if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" >/dev/null 2>&1; then
   ssh_key "bash /root/firewall.sh confirm; rm -f /root/firewall.sh"
   echo "  OK — SSH и xray живы после применения firewall, страховочный таймер отменён."
 else
-  warn "Не удалось подтвердить состояние после firewall новым соединением!"
-  warn "Через 2 минуты сработает страховочный таймер и правила сбросятся сами (nft flush ruleset)."
+  warn "Не удалось подтвердить доступ после firewall новым соединением!"
+  warn "Через 2 минуты страховочный таймер снимет фильтрацию (nft flush + disable nftables) — SSH вернётся."
+  warn "Вход после отката: ssh -i '${KEY_PATH}' -o UserKnownHostsFile='${KNOWN_HOSTS}' -o StrictHostKeyChecking=yes root@${SERVER_IP}"
+  die "Firewall не подтверждён — ссылку не выдаю."
 fi
 
 # ---------------------------------------------------------------------------

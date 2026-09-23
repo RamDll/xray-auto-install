@@ -84,7 +84,7 @@ if [[ -z "$timers" ]]; then r PASS "таймеры отката" "нет"; else 
 for _ in $(seq 1 15); do systemctl is-active --quiet xray && break; sleep 1; done
 chk "xray active" "$(systemctl is-active xray 2>/dev/null)" active
 if /usr/local/bin/xray run -test -c "$C" >/dev/null 2>&1; then r PASS "xray run -test" "Configuration OK"; else r FAIL "xray run -test" "конфиг не принят"; fi
-if ss -ltnp 2>/dev/null | grep ':443 ' | grep -q '"xray"'; then r PASS "443 слушает" "xray"; else r FAIL "443 слушает" "не xray / никто"; fi
+if ss -ltnp 2>/dev/null | grep ':443 ' | grep '"xray"' >/dev/null; then r PASS "443 слушает" "xray"; else r FAIL "443 слушает" "не xray / никто"; fi
 
 # --- Reality target: из конфига + повторная проверка с сервера той же командой, что в install.sh
 sni="$(grep -oE '"serverNames": *\[ *"[^"]+"' "$C" | sed -E 's/.*"([^"]+)"$/\1/')"
@@ -165,6 +165,13 @@ run_checks() {
     report PASS "пароль отвергается" "сервер предлагает только: $methods"
   else
     report FAIL "пароль отвергается" "сервер предлагает: ${methods:-<не удалось узнать>}"
+  fi
+  # --- снаружи: 443 доступен (фильтр хостинга вне nftables закрыл бы его
+  # незаметно). WARN, а не FAIL: причина может быть и в сети этой машины.
+  if timeout 10 bash -c "exec 3<>/dev/tcp/${SERVER_IP}/443" 2>/dev/null; then
+    report PASS "443 снаружи" "TCP-подключение с этой машины проходит"
+  else
+    report WARN "443 снаружи" "не подключается с этой машины (фильтр хостинга? сеть этой машины?)"
   fi
   # --- локально: права summary (в нём ссылка с ключами)
   if [[ -f "$SUMMARY_FILE" ]]; then

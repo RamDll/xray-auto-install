@@ -202,7 +202,9 @@ if   (( MEM_KB < 2 * 1024 * 1024 )); then SWAP_MB=2048
 elif (( MEM_KB <= 4 * 1024 * 1024 )); then SWAP_MB=1024
 else SWAP_MB=0
 fi
-if swapon --show | grep -q .; then
+# `grep >/dev/null`, а не `grep -q`: -q закрывает канал на первом совпадении,
+# и левая команда может получить SIGPIPE — под pipefail это ложный отказ.
+if swapon --show | grep . >/dev/null; then
   log "своп уже есть — пропускаю"
 elif (( SWAP_MB == 0 )); then
   log "RAM $((MEM_KB / 1024))MB > 4 GiB — своп не создаю"
@@ -272,7 +274,10 @@ else
     && systemctl enable --now systemd-timesyncd >/dev/null 2>&1 \
     || log "не удалось поднять синхронизацию времени, продолжаю"
 fi
-for _ in $(seq 1 10); do ntp_ok && break; sleep 1; done
+# До ~60с: только что включённый timesyncd синхронизируется не мгновенно, а
+# проверка Reality target ниже (-verify_return_error) без точного времени
+# отбросит все домены. Если время уже в порядке — цикл выходит сразу.
+for _ in $(seq 1 30); do ntp_ok && break; sleep 2; done
 ntp_ok || log "предупреждение: время ещё не синхронизировано, продолжаю всё равно"
 
 # Reality target — настоящий внешний сайт: неавторизованный клиент (сканер,
@@ -495,7 +500,7 @@ if ! systemctl is-active --quiet xray; then
   journalctl -u xray --no-pager -n 40 2>&1 | redact >&2
   die "xray не запустился (журнал выше, тайны замаскированы)"
 fi
-ss -ltnp | grep -q ':443 ' || die "порт 443 не слушается"
+ss -ltnp | grep ':443 ' >/dev/null || die "порт 443 не слушается"
 
 # Домой уходит только то, что нужно для ссылки. PRIVATE_KEY и DECRYPTION —
 # серверные тайны, они остаются только в config.json.
@@ -539,7 +544,13 @@ if [ -f "$KEY_PATH" ]; then rm -f "$KEY_PATH" "$KEY_PATH.pub"; fi
 ssh-keygen -t ed25519 -N "" -f "$KEY_PATH" -C "xray-auto-install-${SERVER_IP}" >/dev/null
 
 PUBKEY_CONTENT="$(cat "${KEY_PATH}.pub")"
-ssh_pw "mkdir -p /root/.ssh && chmod 700 /root/.ssh && echo '${PUBKEY_CONTENT}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
+# Повторный запуск (после сбоя/отката) создаёт новый ключ — старый ключ этого
+# же скрипта для этого же сервера (комментарий xray-auto-install-<IP>) убираем,
+# чтобы в authorized_keys не копились записи без парного приватного ключа.
+# Чужие ключи не трогаем.
+ssh_pw "mkdir -p /root/.ssh && chmod 700 /root/.ssh && touch /root/.ssh/authorized_keys \
+  && sed -i '/ xray-auto-install-${SERVER_IP//./\\.}\$/d' /root/.ssh/authorized_keys \
+  && echo '${PUBKEY_CONTENT}' >> /root/.ssh/authorized_keys && chmod 600 /root/.ssh/authorized_keys"
 
 log "Проверяю ключевой доступ НОВЫМ соединением (пароль ещё не трогали)..."
 ssh_key "echo ok" >/dev/null || die "Ключевой доступ не заработал — пароль НЕ отключаю, разбирайся руками."
@@ -865,7 +876,7 @@ EOF
     log "nf_conntrack_max недоступен (модуль не загружен?) — пропускаю"
   fi
 
-  if ! { systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '; }; then
+  if ! { systemctl is-active --quiet xray && ss -ltnp | grep ':443 ' >/dev/null; }; then
     log "предупреждение: xray/443 не выглядят активными после применения firewall"
   fi
   log "firewall применён — жду confirm с домашней машины (иначе откат через 2 мин)"
@@ -886,7 +897,7 @@ FIREWALL_OUT="$(ssh_key "XAI_TEST_BREAK_FW=${XAI_TEST_BREAK_FW} bash /root/firew
   || { echo "$FIREWALL_OUT" >&2; die "firewall apply упал (полный вывод выше)."; }
 
 log "Проверяю доступ новым соединением после применения firewall..."
-if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep -q ':443 '" >/dev/null 2>&1; then
+if ssh_key "systemctl is-active --quiet xray && ss -ltnp | grep ':443 ' >/dev/null" >/dev/null 2>&1; then
   ssh_key "bash /root/firewall.sh confirm && rm -f /root/firewall.sh" \
     || die "Не удалось снять страховочный таймер firewall (обрыв соединения?). Через 2 минуты
 фильтрация будет снята (nft flush + disable nftables), ссылку не выдаю.
@@ -935,11 +946,28 @@ ${VLESS_LINK}
   или fp=ios прямо в ссылке (см. README).
 EOF
 
+# 443 снаружи: firewall-этап подтверждал только новое SSH-соединение, а 443 —
+# изнутри сервера. Фильтр у хостинга (вне nftables) закрыл бы его незаметно.
+# Только предупреждение: неудача может быть и на стороне сети этой машины.
+if timeout 10 bash -c "exec 3<>/dev/tcp/${SERVER_IP}/443" 2>/dev/null; then
+  echo "  443/tcp снаружи: доступен"
+else
+  warn "443/tcp на ${SERVER_IP} недоступен с этой машины. Если клиент не подключится —"
+  warn "проверь firewall в панели хостинга (помимо nftables) или сеть этой машины."
+fi
+
 log "Готово!"
 echo
 echo "$VLESS_LINK"
 echo
 echo "Xray-core: ${XRAY_VERSION}"
 echo "Сводка сохранена: $SUMMARY_FILE"
-echo "Проверка сервера: ./verify.sh ${SERVER_IP}   (с перезагрузкой: ./verify.sh --reboot ${SERVER_IP})"
+# При запуске через `bash <(wget …)` рядом нет verify.sh — не отправляем
+# человека к несуществующему файлу.
+VERIFY_SH="$(dirname "${BASH_SOURCE[0]}")/verify.sh"
+if [[ -f "$VERIFY_SH" ]]; then
+  echo "Проверка сервера: ${VERIFY_SH} ${SERVER_IP}   (с перезагрузкой: ${VERIFY_SH} --reboot ${SERVER_IP})"
+else
+  echo "Проверка сервера: verify.sh из репозитория (git clone https://github.com/RamDll/xray-auto-install.git), ./verify.sh ${SERVER_IP}"
+fi
 echo "SSH-ключ: $KEY_PATH"
